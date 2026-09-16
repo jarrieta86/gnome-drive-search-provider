@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Google Drive
+Name[es]=Google Drive
+Comment=Search files in Google Drive from the Activities overview
+Comment[es]=Buscar archivos de Google Drive desde la vista de Actividades
+Exec=xdg-open https://drive.google.com/
+Icon=folder-remote
+NoDisplay=true
+Terminal=false
+Categories=Network;

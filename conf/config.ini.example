@@ -1,0 +1,21 @@
+# Copy to ~/.config/gnome-drive-search-provider/config.ini and edit.
+# Every key is optional; the values below are the defaults.
+
+[search]
+# name: match file names. fulltext: also match file contents (slower, no sorting by date).
+mode = name
+max_results = 10
+min_chars = 3
+# Milliseconds to wait after the last keystroke before querying the API.
+debounce_ms = 250
+# Include shared drives in results.
+shared_drives = true
+# Exit the background process after this many seconds without searches.
+idle_exit_seconds = 300
+
+[auth]
+# Optional fallback when no Google account is configured in GNOME Online Accounts:
+# path to a token file in google-auth "authorized_user" JSON format
+# (keys: client_id, client_secret, refresh_token). Also settable with the
+# GNOME_DRIVE_SEARCH_TOKEN_FILE environment variable.
+# token_file = ~/.config/gcloud/application_default_credentials.json

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PyGObject and tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-gi gir1.2-glib-2.0 python3-pip
+          python3 -m pip install --user pytest ruff
+      - name: Lint
+        run: python3 -m ruff check .
+      - name: Test
+        run: python3 -m pytest -q
+      - name: Shell scripts and desktop file
+        run: |
+          bash -n install.sh uninstall.sh
+          sudo apt-get install -y --no-install-recommends desktop-file-utils
+          desktop-file-validate conf/*.desktop
+      - name: Install into a scratch prefix
+        run: |
+          DATADIR=/tmp/share LIBEXECDIR=/tmp/bin ./install.sh
+          test -x /tmp/bin/gnome-drive-search-provider
+          grep -q "Exec=/tmp/bin/gnome-drive-search-provider" /tmp/share/dbus-1/services/io.github.jarrieta86.DriveSearchProvider.service
+          DATADIR=/tmp/share LIBEXECDIR=/tmp/bin ./uninstall.sh
+          test ! -e /tmp/bin/gnome-drive-search-provider
