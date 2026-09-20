@@ -170,6 +170,26 @@ login fails with "access blocked by your organization", ask the admin to trust
 your client ID, or create the client inside the organization's own Google Cloud
 as an *Internal* app.
 
+### More than one OAuth client
+
+One client is usually enough, but not always. A client created as **Internal**
+inside a Google Workspace organization only accepts accounts of that
+organization: logging in with any other account ends on a Google error page
+saying *"this client is restricted to users within its organization"*
+(`org_internal`). That is the typical situation with a work client and a
+personal Gmail account.
+
+When that happens, press Ctrl+C in the setup. It explains the likely cause and
+asks for another client to use for that account, offering any
+`client_secret*.json` it finds in `~/Downloads`. Create that second client as
+**External** in a personal Google Cloud project, following the steps above.
+
+Each account remembers the client it was connected with, refreshes its token
+with it, and is authorized again with it when you enable more services. Extra
+clients are kept in `~/.config/gnome-google-workspace-search/clients/`, and the
+default client is never replaced. From the command line:
+`--login --client-secret other.json`.
+
 ### Why not GNOME Online Accounts?
 
 It would be the natural choice, but it no longer works: current releases of

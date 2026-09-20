@@ -1270,3 +1270,91 @@ def test_legacy_config_dir_is_migrated_once(tmp_path, monkeypatch):
     (old / "stale").write_text("")
     provider.migrate_legacy_config()  # never overwrites the new directory
     assert not (new / "stale").exists() and old.exists()
+
+
+# ---------------------------------------------------------------------------
+# More than one OAuth client (an Internal work client plus a personal one)
+# ---------------------------------------------------------------------------
+
+
+def write_named_client(directory, name, project):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(json.dumps({"installed": {
+        "client_id": f"{project}-abc.apps.googleusercontent.com", "client_secret": f"s-{project}",
+        "project_id": f"proj-{project}", "token_uri": "https://oauth2.googleapis.com/token"}}))
+    return path
+
+
+def test_login_with_another_client_never_replaces_the_default(tmp_path, monkeypatch):
+    store = write_named_client(tmp_path / "cfg", "client_secret.json", "111")
+    other = write_named_client(tmp_path / "Downloads", "client_secret_222.json", "222")
+    fake_browser(monkeypatch)
+    fake_google(monkeypatch, "me@gmail.com", [])
+    provider.login(str(other), timeout=10, accounts_dir=str(tmp_path / "cfg" / "accounts"),
+                   client_secret_store=str(store))
+    assert provider.load_client_secret(str(store))["project"] == "proj-111"
+    kept = tmp_path / "cfg" / "clients" / "proj-222.json"
+    assert kept.exists() and oct(kept.stat().st_mode & 0o777) == "0o600"
+    saved = json.loads((tmp_path / "cfg" / "accounts" / "me@gmail.com.json").read_text())
+    assert saved["client_id"].startswith("222-")  # the token refreshes with its own client
+    known = provider.known_clients(str(store), str(tmp_path / "cfg" / "clients"))
+    assert [c["project"] for c, _ in known] == ["proj-111", "proj-222"]
+
+
+def test_setup_offers_another_client_when_google_refuses_the_account(tmp_path, monkeypatch, capsys):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    write_named_client(cfg_dir, "client_secret.json", "111")
+    personal = write_named_client(tmp_path / "Downloads", "client_secret_222.json", "222")
+    answers = DRIVE_ONLY + [
+        "",   # add an account? default yes
+        "",   # path to another client: accept the one found in ~/Downloads
+        "",   # add another? no
+        "",   # skip the test
+    ]
+    _, prompts, queue, _ = setup_env(tmp_path, monkeypatch, answers)
+    monkeypatch.setattr(provider, "CLIENTS_DIR", str(cfg_dir / "clients"))
+    attempts = []
+
+    def picky_login(client_secret=None, scopes=None, client=None, **kw):
+        attempts.append(client_secret)
+        if client_secret is None:
+            raise KeyboardInterrupt  # the person saw org_internal and pressed Ctrl+C
+        chosen = provider.load_client_secret(client_secret)
+        payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+        provider.save_account("me@gmail.com", chosen, payload, " ".join(scopes))
+        return "me@gmail.com"
+
+    monkeypatch.setattr(provider, "login", picky_login)
+    assert run_setup_with_config() == 0
+    assert queue == []
+    assert attempts == [None, str(personal)]
+    out = capsys.readouterr().out
+    assert "Login cancelled." in out
+    assert "org_internal" in out and "project proj-111 is Internal" in out
+    assert str(personal) in prompts[6]
+    assert "+ me@gmail.com" in out
+
+
+def test_setup_reauthorizes_an_account_with_the_client_it_was_connected_with(tmp_path, monkeypatch):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    write_named_client(cfg_dir, "client_secret.json", "111")
+    personal = provider.load_client_secret(
+        str(write_named_client(tmp_path / "elsewhere", "c.json", "222")))
+    payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+    provider.save_account("me@gmail.com", personal, payload, provider.SCOPE_METADATA)
+    answers = ["", "", "y", "", "",  # enable Gmail
+               "",                   # authorize it for me@gmail.com now? yes
+               "", ""]
+    _, _, queue, _ = setup_env(tmp_path, monkeypatch, answers)
+    used = []
+
+    def recording_login(client_secret=None, scopes=None, client=None, login_hint=None, **kw):
+        used.append((login_hint, client and client["client_id"]))
+        provider.save_account(login_hint, client, payload, " ".join(scopes))
+        return login_hint
+
+    monkeypatch.setattr(provider, "login", recording_login)
+    monkeypatch.setattr(provider.GmailService, "search", lambda self, account, terms, cfg: [])
+    assert run_setup_with_config() == 0
+    assert used == [("me@gmail.com", "222-abc.apps.googleusercontent.com")]

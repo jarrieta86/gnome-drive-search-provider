@@ -86,6 +86,8 @@ CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "gnome-google-workspace-se
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.ini")
 ACCOUNTS_DIR = os.path.join(CONFIG_DIR, "accounts")
 CLIENT_SECRET_PATH = os.path.join(CONFIG_DIR, "client_secret.json")
+# Extra OAuth clients, for accounts the default one does not accept.
+CLIENTS_DIR = os.path.join(CONFIG_DIR, "clients")
 
 # Chromium-family browsers keep one "Local State" file per installation that
 # lists every profile and the Google account signed in to it. Keyed by the
@@ -494,7 +496,58 @@ def load_client_secret(path):
         "client_secret": client["client_secret"],
         "token_uri": client.get("token_uri") or TOKEN_URL,
         "kind": kind or "installed",
+        "project": client.get("project_id") or client["client_id"].split("-")[0],
     }
+
+
+def remember_client(path, clients_dir=None):
+    """Keep a copy of an extra OAuth client so it can be offered again."""
+    clients_dir = clients_dir or CLIENTS_DIR
+    client = load_client_secret(path)
+    os.makedirs(clients_dir, mode=0o700, exist_ok=True)
+    safe = "".join(c for c in client["project"] if c.isalnum() or c in "._-") or "client"
+    target = os.path.join(clients_dir, safe + ".json")
+    if os.path.abspath(path) != os.path.abspath(target):
+        shutil.copyfile(path, target)
+    os.chmod(target, 0o600)
+    return target
+
+
+def known_clients(store=None, clients_dir=None):
+    """(client, path) of every stored OAuth client, the default one first."""
+    store, clients_dir = store or CLIENT_SECRET_PATH, clients_dir or CLIENTS_DIR
+    paths = [store]
+    try:
+        paths += sorted(os.path.join(clients_dir, n) for n in os.listdir(clients_dir)
+                        if n.endswith(".json"))
+    except FileNotFoundError:
+        pass
+    found, seen = [], set()
+    for path in paths:
+        try:
+            client = load_client_secret(path)
+        except LoginError:
+            continue
+        if client["client_id"] not in seen:
+            seen.add(client["client_id"])
+            found.append((client, path))
+    return found
+
+
+def client_of_account(email, accounts_dir=None):
+    """The OAuth client an account was connected with; authorize it again with the same one."""
+    try:
+        with open(account_path(email, accounts_dir)) as f:
+            data = json.load(f)
+        return {
+            "client_id": data["client_id"],
+            "client_secret": data["client_secret"],
+            "token_uri": data.get("token_uri") or TOKEN_URL,
+            "kind": "installed",
+            "project": data["client_id"].split("-")[0],
+        }
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def pkce_pair():
@@ -657,13 +710,16 @@ def stored_accounts(accounts_dir=None):
 
 
 def login(client_secret=None, fulltext=False, port=0, open_browser=True, timeout=300,
-          accounts_dir=None, client_secret_store=None, scopes=None, login_hint=None):
+          accounts_dir=None, client_secret_store=None, scopes=None, login_hint=None,
+          client=None, clients_dir=None):
     """Add (or re-authorize) a Google account. Returns its email.
 
     scopes lists what to ask for; without it, Drive alone (contents too with fulltext).
+    client_secret is an OAuth client file to use instead of the stored default; client
+    is one already loaded (the one an existing account was connected with).
     """
     store = client_secret_store or CLIENT_SECRET_PATH
-    client = load_client_secret(client_secret or store)
+    client = client or load_client_secret(client_secret or store)
     scope = " ".join(scopes) if scopes else (SCOPE_READONLY if fulltext else SCOPE_METADATA)
     verifier, challenge = pkce_pair()
     state = secrets.token_urlsafe(16)
@@ -683,7 +739,8 @@ def login(client_secret=None, fulltext=False, port=0, open_browser=True, timeout
                 Gio.AppInfo.launch_default_for_uri(url, None)
             except GLib.Error:
                 pass
-        print("Waiting for you to approve access...", flush=True)
+        print("Waiting for you to approve access... (if Google shows an error page instead, "
+              "press Ctrl+C here)", flush=True)
         code = wait_for_redirect(server, state, timeout)
     finally:
         server.server_close()
@@ -692,9 +749,13 @@ def login(client_secret=None, fulltext=False, port=0, open_browser=True, timeout
     email = fetch_email(payload["access_token"])
     path = save_account(email, client, payload, scope, accounts_dir)
     if client_secret and os.path.abspath(client_secret) != os.path.abspath(store):
-        os.makedirs(os.path.dirname(store), exist_ok=True)
-        shutil.copyfile(client_secret, store)
-        os.chmod(store, 0o600)
+        if os.path.exists(store):
+            # Never replace the default client: other accounts may depend on it.
+            remember_client(client_secret, clients_dir or os.path.join(os.path.dirname(store), "clients"))
+        else:
+            os.makedirs(os.path.dirname(store), mode=0o700, exist_ok=True)
+            shutil.copyfile(client_secret, store)
+            os.chmod(store, 0o600)
     print(f"Connected {email} (token saved to {path}).")
     return email
 
@@ -1411,6 +1472,17 @@ CLIENT_GUIDE = """\
 """
 
 
+REFUSED_HINT = """\
+  If Google refused the account, the usual reasons are:
+    - "restricted to users within its organization" (org_internal): the OAuth client
+      of project {project} is Internal, so it only accepts accounts of that Google
+      Workspace organization. Use another client, of type External, for this account.
+    - "has not completed the Google verification process" with no way forward: the
+      app is in Testing and this account is not one of its test users. Publish the
+      app, or add the account as a test user, in the Google Cloud console.
+  Each account remembers the client it was connected with, so they can differ."""
+
+
 def ask(prompt, default=""):
     suffix = f" [{default}]" if default else ""
     try:
@@ -1580,11 +1652,36 @@ def _setup_steps(cfg, config_path):
     scopes = login_scopes(cfg)
 
     def connect(hint=None):
-        try:
-            address = login(scopes=scopes, login_hint=hint)
-        except LoginError as e:
-            print(f"  Login failed: {e}")
-            return
+        # An account is authorized again with the client it was connected with.
+        client, path, tried = (client_of_account(hint) if hint else None), None, set()
+        while True:
+            using = client or load_client_secret(path or CLIENT_SECRET_PATH)
+            tried.add(using["client_id"])
+            try:
+                address = login(client_secret=path, client=client, scopes=scopes, login_hint=hint)
+                break
+            except KeyboardInterrupt:
+                print("\n  Login cancelled.")
+            except LoginError as e:
+                print(f"  Login failed: {e}")
+            print(REFUSED_HINT.format(project=using["project"]))
+            others = [p for c, p in known_clients() if c["client_id"] not in tried]
+            for candidate in find_client_secret_candidates():
+                try:
+                    if load_client_secret(candidate)["client_id"] not in tried:
+                        others.append(candidate)
+                except LoginError:
+                    pass
+            path = os.path.expanduser(ask("  Path to another OAuth client for this account "
+                                          "(empty to skip it)", others[0] if others else ""))
+            if not path:
+                return
+            try:
+                load_client_secret(path)
+            except LoginError as e:
+                print(f"  {e}")
+                return
+            client = None
         manager.invalidate()
         added = next((a for a in manager.all() if a.identity == address), None)
         if added:
