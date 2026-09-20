@@ -1,21 +1,34 @@
-# gnome-drive-search-provider
+# gnome-google-workspace-search
 
-Search your Google Drive from the GNOME Activities overview.
+Search Google Drive, Gmail, Google Calendar and Google Contacts from the GNOME
+Activities overview.
 
-Type part of a file name in the overview and a **Google Drive** section appears
-with matching files from every Google account you have logged in to, personal
-and work alike. Pick one and it opens in your browser with the right account.
-Nothing is synced or indexed locally: each search is a live query to the Drive
-API.
+Type in the overview and each service you enabled shows its own section with
+matches from every Google account you connected, personal and work alike. Pick a
+result and it opens in your browser as the right account, in the right browser
+profile. Nothing is synced or indexed locally: every search is a live query to
+Google's APIs.
 
 ```
-Activities  >  "budget 2026"
+Activities  >  "budget"
 
   Google Drive
-    Budget 2026 - draft         Spreadsheet - Ann Lee - 2026-09-01
-    Budget 2026 planning        Folder - Ann Lee - 2026-08-20
-    budget-2026-notes.docx      Word - Bob Ruiz - 2026-08-14
+    Budget 2026 - draft          Spreadsheet - Ann Lee - 2026-09-01 - me@work.com
+    budget-notes.docx            Word - Bob Ruiz - 2026-08-14 - me@gmail.com
+  Gmail
+    Re: Budget approval          Ann Lee - 2026-09-18 - me@work.com
+  Google Calendar
+    Budget review                2026-09-25 15:30 - Room 1 - me@work.com
+  Google Contacts
+    Ann Lee                      ann@work.com - CFO, Acme - me@work.com
 ```
+
+Only Google Drive is searched out of the box. Every other service is off until
+you switch it on, and an account is only ever asked for the permissions of the
+services you enabled.
+
+> Formerly `gnome-drive-search-provider`. Installing this version replaces the
+> old one and keeps your accounts and settings.
 
 ## Requirements
 
@@ -23,93 +36,92 @@ Activities  >  "budget 2026"
 - Python 3.8+ with PyGObject (`python3-gi` on Debian/Ubuntu, `python-gobject` on
   Arch, `python3-gobject` on Fedora). Already present on any GNOME desktop.
 - An OAuth client of your own from Google Cloud, a one-time, free, five-minute
-  setup (see [Connect your Google accounts](#connect-your-google-accounts)).
+  step that the setup walks you through
+  (see [Creating the OAuth client](#creating-the-oauth-client)).
 
-No other dependencies: the provider talks to D-Bus through GLib and to the
-Drive API with the standard library.
+No other dependencies: D-Bus through GLib, Google's APIs with the standard library.
 
 ## Install
 
 ```sh
-git clone https://github.com/jarrieta86/gnome-drive-search-provider.git
-cd gnome-drive-search-provider
+git clone https://github.com/jarrieta86/gnome-google-workspace-search.git
+cd gnome-google-workspace-search
 ./install.sh                  # current user
 sudo ./install.sh --system    # or: every user, under /usr/local
 ```
 
-Next, [connect your Google accounts](#connect-your-google-accounts). Then open the
-Activities overview and type. GNOME Shell reloads its providers
-when the desktop file is installed, so no restart is needed. If the **Google
-Drive** section does not appear, check that it is enabled in **Settings >
-Search**, or log out and back in.
+Accept the installer's offer to run the guided setup, then open the Activities
+overview and type. GNOME Shell reloads its providers when the desktop files are
+installed, so no restart is needed. If a section does not appear, check that it
+is enabled in **Settings > Search**, or log out and back in.
 
 **About per-user installs.** GNOME Shell only loads search provider definitions
 from the system data directories listed in `XDG_DATA_DIRS`; it never reads
 `~/.local/share/gnome-shell/search-providers`. `./install.sh` therefore places
-the one-line `.ini` definition in the first entry of `XDG_DATA_DIRS` that you
+the one-line `.ini` definitions in the first entry of `XDG_DATA_DIRS` that you
 can write to. With Flatpak installed that is
 `~/.local/share/flatpak/exports/share`, the same place Flatpak uses to export
 the search providers of its apps, and no root is needed. If no entry is
 writable, the installer prints the single `sudo install` command that registers
-the provider; everything else still lives in your home directory.
+the providers; everything else still lives in your home directory.
 
-A **Google Drive** launcher is also added to the app grid (it opens Drive in the
-browser). It has to be visible: GNOME Shell ignores search providers whose
-desktop file is hidden with `NoDisplay=true`.
+Four launchers (Google Drive, Gmail, Google Calendar, Google Contacts) are added
+to the app grid; they open each service in the browser. They have to be visible:
+GNOME Shell ignores search providers whose desktop file is hidden with
+`NoDisplay=true`. The icons are the project's own, not Google's logos.
 
 Remove everything with `./uninstall.sh` (or `sudo ./uninstall.sh --system`).
 
-## How it works
-
-`gnome-drive-search-provider` is a small D-Bus service started on demand by the
-session bus the first time GNOME Shell asks it for results, and it exits after
-five minutes without searches. It implements the five methods of
-`org.gnome.Shell.SearchProvider2`:
-
-- `GetInitialResultSet` / `GetSubsearchResultSet`: wait 250 ms after the last
-  keystroke (so intermediate queries are skipped), then call `files.list` on the
-  Drive API with `name contains '<term>'` for each term, across My Drive and
-  shared drives, for all accounts in parallel, newest first.
-- `GetResultMetas`: file name, a description with type, owner and date, and a
-  themed icon matching the file type.
-- `ActivateResult`: opens the file's web link with the default browser, as the
-  account that found it and in that account's browser profile when there is one.
-- `LaunchSearch`: opens the same query in the Drive web search.
-
-Queries shorter than 3 characters are ignored to avoid hammering the API.
-
-## Connect your Google accounts
+## Setup
 
 ```sh
-gnome-drive-search-provider --login --client-secret ~/Downloads/client_secret.json
+gnome-google-workspace-search --setup
 ```
 
-Your browser opens on Google's consent screen; approve it and the account is
-connected. The provider only asks for `drive.metadata.readonly`: it can see file
-names, owners and dates, never file contents.
+A short conversation in the terminal, safe to run again whenever you want to
+change something. It never removes anything.
 
-**Several accounts.** Run `--login` once per account (the client secret is only
-needed the first time; it is remembered). All accounts are searched at the same
-time, each result says which account it came from, and opening it adds
-`authuser=<email>` to the link so the browser uses that account instead of your
-default one. If your accounts live in different browser profiles, copy the link
-that `--login` prints into the right profile instead of using the window it
-opens.
+1. **GNOME Shell integration**: confirms the Shell can see the providers.
+2. **Services**: choose what to search. Each service states the permission it
+   needs before you say yes.
+3. **OAuth client**: stores your client, offering the newest
+   `client_secret*.json` in `~/Downloads`, or prints how to create one.
+4. **Google accounts**: lists the connected accounts with the browser profile
+   each opens in, asks already connected accounts to authorize any service you
+   just enabled, and adds as many accounts as you want (one browser login each).
+5. **Test**: runs a search across the enabled services.
 
-```sh
-gnome-drive-search-provider --login             # add another account
-gnome-drive-search-provider --accounts          # list them
-gnome-drive-search-provider --logout me@x.com   # revoke and remove one
-```
+### Services and permissions
+
+| Service | Default | Permission requested | What it can see |
+| --- | --- | --- | --- |
+| Google Drive | on | `drive.metadata.readonly` | File names, owners, dates. Never contents, unless you opt in to content search (`drive.readonly`) |
+| Gmail | off | `gmail.readonly` | **All your mail.** Google has a metadata-only permission, but it cannot search |
+| Google Calendar | off | `calendar.events.readonly` | Events of your primary calendar |
+| Google Contacts | off | `contacts.readonly`, `contacts.other.readonly`, `directory.readonly` | Your contacts, the people you have exchanged mail with and, on work accounts, your organization's directory |
+
+All access is read-only. Tokens are stored one file per account in
+`~/.config/gnome-google-workspace-search/accounts/`, readable only by you. Think
+about who else can read your home directory before enabling Gmail.
+
+A service can also be hidden at any time in **Settings > Search** without
+touching its permission.
+
+### Several accounts
+
+Every account is searched at the same time, each result says which account it
+came from, and opening it adds `authuser=<email>` to the link so the browser
+uses that account instead of your default one. Accounts can differ in what they
+authorized: a service simply skips the accounts that have not granted it.
 
 **Browser profiles.** If your default browser is Chrome, Chromium, Brave, Edge
 or Vivaldi and you keep each account in its own browser profile, results open in
 the profile signed in to the account that found them. The provider reads the
 browser's own profile list, so there is nothing to configure. If a profile is
-not signed in to Chrome itself (only to Google inside it), map it by hand:
+not signed in to the browser itself (only to Google inside it), map it by hand:
 
 ```ini
-# ~/.config/gnome-drive-search-provider/config.ini
+# ~/.config/gnome-google-workspace-search/config.ini
 [browser_profiles]
 me@work.com = Profile 2
 ```
@@ -117,65 +129,96 @@ me@work.com = Profile 2
 Profile directory names are shown in `chrome://version` under *Profile Path*.
 Other browsers, and accounts with no matching profile, open in the default
 browser window as usual. Set `use_profiles = false` under `[browser]` to turn
-this off.
+this off. When logging in, copy the link the setup prints into the right profile
+instead of using the window it opens.
 
-Tokens are stored one file per account in
-`~/.config/gnome-drive-search-provider/accounts/`, readable only by you. A
-running provider notices new accounts within a minute.
+### Without the wizard
+
+```sh
+gnome-google-workspace-search --login --client-secret ~/Downloads/client_secret.json
+gnome-google-workspace-search --login             # another account, or authorize one again
+gnome-google-workspace-search --accounts          # accounts and what each can search
+gnome-google-workspace-search --logout me@x.com   # revoke and remove one
+```
+
+`--login` requests the permissions of the services enabled in `config.ini`.
 
 ### Creating the OAuth client
 
-Google classifies every Drive scope as *restricted*, which means a project like
-this cannot ship a shared, verified OAuth client without a paid yearly security
-audit. So you create your own, once:
+Google classifies Drive and Gmail permissions as *restricted*, which means a
+project like this cannot ship a shared, verified OAuth client without a paid
+yearly security audit. So you create your own, once:
 
 1. Open the [Google Cloud console](https://console.cloud.google.com/), create a
-   project (any name) and enable the **Google Drive API** under *APIs & Services
-   > Library*.
+   project (any name) and, under *APIs & Services > Library*, enable the API of
+   each service you want: **Google Drive API**, **Gmail API**, **Google Calendar
+   API**, **People API** (contacts).
 2. Under *APIs & Services > OAuth consent screen*, choose **External** (or
    **Internal** if this is a Google Workspace project and you only need accounts
    of that organization). Fill in the app name and your email.
 3. Still on the consent screen, either add each of your accounts as a **test
    user**, or press **Publish app**. Prefer publishing: while an External app is
    in *Testing*, Google expires its refresh tokens after 7 days and you would
-   have to `--login` again every week. A published, unverified app works for up
-   to 100 users; you will see a "Google hasn't verified this app" warning during
+   have to log in again every week. A published, unverified app works for up to
+   100 users; you will see a "Google hasn't verified this app" warning during
    login, which is expected for your own client (*Advanced > Go to ...*).
 4. Under *APIs & Services > Credentials*, create an **OAuth client ID** of type
-   **Desktop app** and download its JSON. That file is the `--client-secret`.
+   **Desktop app** and download its JSON. That file is what the setup asks for.
 
-Work accounts: a Google Workspace administrator can block third-party apps from
-Drive. If login fails with "access blocked by your organization", ask the admin
-to trust your client ID, or create the client inside the organization's own
-Google Cloud as an *Internal* app.
+Work accounts: a Google Workspace administrator can block third-party apps. If
+login fails with "access blocked by your organization", ask the admin to trust
+your client ID, or create the client inside the organization's own Google Cloud
+as an *Internal* app.
+
+### More than one OAuth client
+
+One client is usually enough, but not always. A client created as **Internal**
+inside a Google Workspace organization only accepts accounts of that
+organization: logging in with any other account ends on a Google error page
+saying *"this client is restricted to users within its organization"*
+(`org_internal`). That is the typical situation with a work client and a
+personal Gmail account.
+
+When that happens, press Ctrl+C in the setup. It explains the likely cause and
+asks for another client to use for that account, offering any
+`client_secret*.json` it finds in `~/Downloads`. Create that second client as
+**External** in a personal Google Cloud project, following the steps above.
+
+Each account remembers the client it was connected with, refreshes its token
+with it, and is authorized again with it when you enable more services. Extra
+clients are kept in `~/.config/gnome-google-workspace-search/clients/`, and the
+default client is never replaced. From the command line:
+`--login --client-secret other.json`.
 
 ### Why not GNOME Online Accounts?
 
 It would be the natural choice, but it no longer works: current releases of
 GNOME Online Accounts (checked on 3.58) do not request any Drive scope from
-Google, so the tokens they hand out are rejected by the Drive API with
-"insufficient authentication scopes". The *files* label in Settings is a
-leftover. The provider still looks at GNOME Online Accounts for the benefit of
-old GNOME releases, and silently stops using an account after the first such
-rejection.
+Google, so the tokens they hand out are rejected with "insufficient
+authentication scopes". The *files* label in Settings is a leftover. The
+provider still looks at GNOME Online Accounts for the benefit of old GNOME
+releases, and stops using an account for a service after the first rejection.
 
 ### Using an existing token file
 
 If you already have a token in google-auth's `authorized_user` JSON format
-(`client_id`, `client_secret`, `refresh_token`) with a Drive scope, you can point
-the provider at it instead of logging in, with `auth.token_file` in the config
-file or the `GNOME_DRIVE_SEARCH_TOKEN_FILE` environment variable.
+(`client_id`, `client_secret`, `refresh_token`), you can point the provider at it
+instead of logging in, with `auth.token_file` in the config file or the
+`GNOME_DRIVE_SEARCH_TOKEN_FILE` environment variable. It is used for whichever
+enabled services its scopes cover.
 
 ## Configuration
 
-Optional, in `~/.config/gnome-drive-search-provider/config.ini`. See
+Optional, in `~/.config/gnome-google-workspace-search/config.ini`. The setup
+writes the `[services]` section and `search.mode` for you. See
 [`conf/config.ini.example`](conf/config.ini.example) for every key and its
 default. The most useful ones:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `search.mode` | `name` | `name` matches file names; `fulltext` also matches contents (slower, unsorted; log in with `--login --fulltext` to grant read access) |
-| `search.max_results` | `10` | Results shown per search |
+| `services.drive`, `.gmail`, `.calendar`, `.contacts` | `true`, then `false` | Which services are searched |
+| `search.mode` | `name` | Drive only. `name` matches file names; `fulltext` also matches contents (slower, unsorted, needs read access) |
+| `search.max_results` | `10` | Results per service |
 | `search.min_chars` | `3` | Shorter queries are ignored |
 | `search.shared_drives` | `true` | Include shared drives |
 | `browser.use_profiles` | `true` | Open results in the browser profile of their account |
@@ -183,31 +226,60 @@ default. The most useful ones:
 
 Descriptions are shown in English or Spanish depending on your locale.
 
+Search tips: Gmail receives what you type untouched, so its operators work
+(`from:ann has:attachment budget`). Calendar lists upcoming events first, then
+the last 90 days. Contacts matches names, emails and phone numbers by prefix.
+
+## How it works
+
+`gnome-google-workspace-search` is one small D-Bus service, started on demand by
+the session bus the first time GNOME Shell asks for results, which exits after
+five minutes without searches. It exports one `org.gnome.Shell.SearchProvider2`
+object per service, so GNOME Shell shows and manages each as a separate
+provider:
+
+- `GetInitialResultSet` / `GetSubsearchResultSet`: wait 250 ms after the last
+  keystroke (so intermediate queries are skipped), then query the service's API
+  for all accounts in parallel. A disabled service answers at once with nothing.
+- `GetResultMetas`: title, a one-line description and an icon.
+- `ActivateResult`: opens the result's web link with the default browser, as the
+  account that found it and in that account's browser profile when there is one.
+- `LaunchSearch`: opens the same query in the service's own web search.
+
+Queries shorter than 3 characters are ignored to avoid hammering the APIs. When
+Google refuses a service for an account in a way that will not fix itself
+(missing permission, API not enabled in your project), the provider logs why
+once and stops asking for that combination.
+
 ## Troubleshooting
 
 Run a search from the terminal, without GNOME Shell involved:
 
 ```sh
-gnome-drive-search-provider --query budget 2026
+gnome-google-workspace-search --query budget 2026
+gnome-google-workspace-search --query budget --service gmail
 ```
 
 Call the D-Bus service the way GNOME Shell does:
 
 ```sh
-gdbus call --session --dest io.github.jarrieta86.DriveSearchProvider \
-  --object-path /io/github/jarrieta86/DriveSearchProvider \
+gdbus call --session --dest io.github.jarrieta86.GoogleWorkspaceSearch \
+  --object-path /io/github/jarrieta86/GoogleWorkspaceSearch/Drive \
   --method org.gnome.Shell.SearchProvider2.GetInitialResultSet "['budget']"
 ```
 
-Logs go to the journal: `journalctl --user -f | grep gnome-drive-search-provider`.
-Start the service by hand with `gnome-drive-search-provider --verbose` to see
+Logs go to the journal: `journalctl --user -f | grep gnome-google-workspace-search`.
+Start the service by hand with `gnome-google-workspace-search --verbose` to see
 every request.
 
-No results: check `gnome-drive-search-provider --accounts`. An empty list means
-you still have to `--login`. If an account is listed but the log says its token
-"lacks the Drive permission", log in to it again (with `--fulltext` if you use
-`mode = fulltext`). If searches stop working after a week, your OAuth app is
-still in *Testing*; publish it (see above) and log in once more.
+- **No results anywhere**: check `--accounts`. An empty list means you still have
+  to run `--setup`.
+- **One service shows nothing**: `--accounts` tells you which accounts are "not
+  authorized for" it; run `--setup` to authorize them. If the log says the API
+  "is not enabled in the Google Cloud project", enable it in the console (step 1
+  of the client guide) and restart the provider.
+- **Everything stops working after a week**: your OAuth app is still in
+  *Testing*; publish it (see above) and log in once more.
 
 ## Development
 
@@ -218,7 +290,9 @@ python3 -m venv --system-site-packages .venv   # keeps access to PyGObject
 .venv/bin/ruff check .
 ```
 
-Tests do not touch the network or D-Bus.
+Tests do not touch the network or D-Bus. Adding a service means one `Service`
+subclass (scopes, search, presentation, links) plus its `.ini`, `.desktop` and
+icon; accounts, login, the setup and the D-Bus plumbing are shared.
 
 ## License
 
