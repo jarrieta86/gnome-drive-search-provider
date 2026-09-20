@@ -6,9 +6,9 @@
 # Each one is its own section in the Activities overview. After enabling one,
 # run --setup (or --login) so your accounts authorize it.
 drive = true
+contacts = true
 gmail = false
 calendar = false
-contacts = true
 
 [search]
 # name: match file names. fulltext: also match file contents (slower, no sorting by

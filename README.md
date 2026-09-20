@@ -88,9 +88,9 @@ change something. It never removes anything.
 
    ```
      > [x] Google Drive     file names, owners and dates
+       [x] Google Contacts  reads contacts, people you wrote to, work directory
        [ ] Gmail            reads ALL your mail
-       [x] Google Calendar  reads your events
-       [ ] Google Contacts  reads contacts, people you wrote to, work directory
+       [ ] Google Calendar  reads your events
    ```
 
    Terminals that cannot be driven key by key get one yes/no question per
@@ -108,9 +108,9 @@ change something. It never removes anything.
 | Service | Default | Permission requested | What it can see |
 | --- | --- | --- | --- |
 | Google Drive | on | `drive.metadata.readonly` | File names, owners, dates. Never contents, unless you opt in to content search (`drive.readonly`) |
+| Google Contacts | on | `contacts.readonly`, `contacts.other.readonly`, `directory.readonly` | Your contacts, the people you have exchanged mail with and, on work accounts, your organization's directory |
 | Gmail | off | `gmail.readonly` | **All your mail.** Google has a metadata-only permission, but it cannot search |
 | Google Calendar | off | `calendar.events.readonly` | Events of your primary calendar |
-| Google Contacts | on | `contacts.readonly`, `contacts.other.readonly`, `directory.readonly` | Your contacts, the people you have exchanged mail with and, on work accounts, your organization's directory |
 
 All access is read-only. Tokens are stored one file per account in
 `~/.config/gnome-google-workspace-search/accounts/`, readable only by you. Think
@@ -243,7 +243,7 @@ default. The most useful ones:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `services.drive`, `.gmail`, `.calendar`, `.contacts` | `true`, `false`, `false`, `true` | Which services are searched |
+| `services.drive`, `.contacts`, `.gmail`, `.calendar` | `true`, `true`, `false`, `false` | Which services are searched |
 | `search.mode` | `name` | Drive only. `name` matches file names; `fulltext` also matches contents (slower, unsorted, needs read access) |
 | `search.max_results` | `10` | Results per service |
 | `search.min_chars` | `3` | Shorter queries are ignored |

@@ -2,7 +2,7 @@
 """GNOME Shell search providers for Google Workspace.
 
 One D-Bus service exports a search provider (org.gnome.Shell.SearchProvider2)
-per Google service: Drive, Gmail, Calendar and Contacts. Each one shows up as its
+per Google service: Drive, Contacts, Gmail and Calendar. Each one shows up as its
 own section in the Activities overview and can be switched on and off, both here
 (``--setup``) and in Settings > Search. Drive and Contacts are enabled by default,
 Gmail and Calendar are not, and an account is only ever asked for the permissions
@@ -136,7 +136,7 @@ DEFAULTS = {
     "shared_drives": True,
     "idle_exit_seconds": 300,
     "token_file": "",
-    "services": {"drive": True, "gmail": False, "calendar": False, "contacts": True},
+    "services": {"drive": True, "contacts": True, "gmail": False, "calendar": False},
     "use_profiles": True,
     "profiles": {},  # manual overrides: account email -> browser profile directory
 }
@@ -1203,7 +1203,8 @@ class ContactsService(Service):
         return "https://contacts.google.com/search/" + urllib.parse.quote(" ".join(terms))
 
 
-SERVICES = [DriveService(), GmailService(), CalendarService(), ContactsService()]
+# In the order they are listed to the user: the ones enabled by default first.
+SERVICES = [DriveService(), ContactsService(), GmailService(), CalendarService()]
 SERVICES_BY_KEY = {service.key: service for service in SERVICES}
 
 
