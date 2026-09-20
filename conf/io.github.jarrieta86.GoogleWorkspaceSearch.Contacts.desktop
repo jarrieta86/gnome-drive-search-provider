@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Google Contacts
+Comment=Search Google Contacts from the Activities overview
+Comment[es]=Buscar contactos de Google desde la vista de Actividades
+Exec=xdg-open https://contacts.google.com/
+Icon=io.github.jarrieta86.GoogleWorkspaceSearch.Contacts
+Terminal=false
+Categories=GNOME;Network;
+OnlyShowIn=GNOME;

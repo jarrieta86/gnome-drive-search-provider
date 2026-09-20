@@ -1,5 +1,14 @@
-# Copy to ~/.config/gnome-drive-search-provider/config.ini and edit.
+# Copy to ~/.config/gnome-google-workspace-search/config.ini and edit.
 # Every key is optional; the values below are the defaults.
+# `gnome-google-workspace-search --setup` writes [services] and search.mode for you.
+
+[services]
+# Each one is its own section in the Activities overview. After enabling one,
+# run --setup (or --login) so your accounts authorize it.
+drive = true
+gmail = false
+calendar = false
+contacts = false
 
 [search]
 # name: match file names. fulltext: also match file contents (slower, no sorting by
@@ -15,7 +24,7 @@ shared_drives = true
 idle_exit_seconds = 300
 
 [auth]
-# Accounts are normally added with: gnome-drive-search-provider --login
+# Accounts are normally added with: gnome-google-workspace-search --login
 # Optional extra account from an existing token file in google-auth
 # "authorized_user" JSON format (keys: client_id, client_secret, refresh_token)
 # that has a Drive scope. Also settable with GNOME_DRIVE_SEARCH_TOKEN_FILE.

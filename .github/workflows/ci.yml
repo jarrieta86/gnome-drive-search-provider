@@ -26,10 +26,17 @@ jobs:
           desktop-file-validate conf/*.desktop
       - name: Install into a scratch prefix
         run: |
-          DATADIR=/tmp/share LIBEXECDIR=/tmp/bin PROVIDERDIR=/tmp/share/gnome-shell/search-providers ./install.sh
-          test -x /tmp/bin/gnome-drive-search-provider
-          grep -q "Exec=/tmp/bin/gnome-drive-search-provider" /tmp/share/dbus-1/services/io.github.jarrieta86.DriveSearchProvider.service
-          test -f /tmp/share/gnome-shell/search-providers/io.github.jarrieta86.DriveSearchProvider.ini
-          DATADIR=/tmp/share LIBEXECDIR=/tmp/bin ./uninstall.sh
-          test ! -e /tmp/share/gnome-shell/search-providers/io.github.jarrieta86.DriveSearchProvider.ini
-          test ! -e /tmp/bin/gnome-drive-search-provider
+          ID=io.github.jarrieta86.GoogleWorkspaceSearch
+          export DATADIR=/tmp/share LIBEXECDIR=/tmp/bin PROVIDERDIR=/tmp/share/gnome-shell/search-providers
+          ./install.sh
+          test -x /tmp/bin/gnome-google-workspace-search
+          grep -q "Exec=/tmp/bin/gnome-google-workspace-search" /tmp/share/dbus-1/services/$ID.service
+          for s in Drive Gmail Calendar Contacts; do
+            test -f $PROVIDERDIR/$ID.$s.ini
+            test -f /tmp/share/applications/$ID.$s.desktop
+            test -f /tmp/share/icons/hicolor/scalable/apps/$ID.$s.svg
+          done
+          /tmp/bin/gnome-google-workspace-search --help > /dev/null
+          ./uninstall.sh
+          test ! -e /tmp/bin/gnome-google-workspace-search
+          test -z "$(ls $PROVIDERDIR)"

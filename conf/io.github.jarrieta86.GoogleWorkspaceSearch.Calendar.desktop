@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Google Calendar
+Comment=Search Google Calendar events from the Activities overview
+Comment[es]=Buscar eventos de Google Calendar desde la vista de Actividades
+Exec=xdg-open https://calendar.google.com/
+Icon=io.github.jarrieta86.GoogleWorkspaceSearch.Calendar
+Terminal=false
+Categories=GNOME;Network;
+OnlyShowIn=GNOME;

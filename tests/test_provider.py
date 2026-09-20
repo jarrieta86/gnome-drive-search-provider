@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = ROOT / "gnome-drive-search-provider.py"
+SCRIPT = ROOT / "gnome-google-workspace-search.py"
+SERVICE_NAMES = ["Drive", "Gmail", "Calendar", "Contacts"]
 
 spec = importlib.util.spec_from_file_location("provider", SCRIPT)
 provider = importlib.util.module_from_spec(spec)
@@ -222,8 +223,8 @@ class FakeInvocation:
 def make_provider(monkeypatch, files, **cfg_overrides):
     cfg = dict(provider.DEFAULTS, debounce_ms=1, **cfg_overrides)
     sp = provider.SearchProvider(GLib.MainLoop(), cfg)
-    sp._accounts = [make_account(["t"] * 10)]
-    sp._accounts_at = float("inf")
+    sp.manager._accounts = [make_account(["t"] * 10)]
+    sp.manager._accounts_at = float("inf")
     monkeypatch.setattr(provider, "drive_search", lambda account, terms, cfg, **kw: list(files))
     return sp
 
@@ -312,30 +313,35 @@ def test_goa_accounts_returns_empty_when_service_missing(monkeypatch):
 
 def test_conf_files_agree_on_ids():
     conf = ROOT / "conf"
-    ini = (conf / f"{provider.APP_ID}.ini").read_text()
-    assert f"BusName={provider.BUS_NAME}" in ini
-    assert f"ObjectPath={provider.OBJECT_PATH}" in ini
-    assert f"DesktopId={provider.APP_ID}.desktop" in ini
-    assert (conf / f"{provider.APP_ID}.desktop").exists()
+    for name in SERVICE_NAMES:
+        ini = (conf / f"{provider.APP_ID}.{name}.ini").read_text()
+        assert f"BusName={provider.BUS_NAME}" in ini
+        assert f"ObjectPath={provider.OBJECT_PATH}/{name}\n" in ini
+        assert f"DesktopId={provider.APP_ID}.{name}.desktop" in ini
+        assert (conf / f"{provider.APP_ID}.{name}.desktop").exists()
+        assert (ROOT / "icons" / f"{provider.APP_ID}.{name}.svg").exists()
+    assert [s.object_name for s in provider.SERVICES] == SERVICE_NAMES
     assert f"Name={provider.BUS_NAME}" in (conf / f"{provider.APP_ID}.service.in").read_text()
     assert os.access(SCRIPT, os.X_OK)
 
 
-def test_desktop_file_is_accepted_by_gnome_shell(monkeypatch):
+def test_desktop_files_are_accepted_by_gnome_shell(monkeypatch):
     # GNOME Shell drops providers whose desktop file fails should_show(), which
     # is the case with NoDisplay=true or when OnlyShowIn excludes GNOME.
     monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
-    path = ROOT / "conf" / f"{provider.APP_ID}.desktop"
-    assert "NoDisplay" not in path.read_text()
     gi = pytest.importorskip("gi")
     try:
         gi.require_version("GioUnix", "2.0")
         from gi.repository import GioUnix
-        info = GioUnix.DesktopAppInfo.new_from_filename(str(path))
+        loader = GioUnix.DesktopAppInfo
     except (ValueError, ImportError):
-        info = provider.Gio.DesktopAppInfo.new_from_filename(str(path))
-    assert info is not None
-    assert info.should_show()
+        loader = provider.Gio.DesktopAppInfo
+    for name in SERVICE_NAMES:
+        path = ROOT / "conf" / f"{provider.APP_ID}.{name}.desktop"
+        assert "NoDisplay" not in path.read_text()
+        info = loader.new_from_filename(str(path))
+        assert info is not None and info.should_show()
+        assert f"Icon={provider.APP_ID}.{name}\n" in path.read_text()
 
 
 def test_user_install_registers_ini_in_a_writable_xdg_data_dir(tmp_path):
@@ -349,15 +355,22 @@ def test_user_install_registers_ini_in_a_writable_xdg_data_dir(tmp_path):
     env.pop("XDG_DATA_HOME", None)
     env.pop("PROVIDERDIR", None)
     subprocess.run([str(ROOT / "install.sh")], check=True, env=env, capture_output=True)
-    ini = xdg / "gnome-shell" / "search-providers" / f"{provider.APP_ID}.ini"
-    assert ini.exists()
+    inis = [xdg / "gnome-shell" / "search-providers" / f"{provider.APP_ID}.{n}.ini"
+            for n in SERVICE_NAMES]
+    assert all(ini.exists() for ini in inis)
+    share = home / ".local/share"
+    for n in SERVICE_NAMES:
+        assert (share / "applications" / f"{provider.APP_ID}.{n}.desktop").exists()
+        assert (share / "icons/hicolor/scalable/apps" / f"{provider.APP_ID}.{n}.svg").exists()
     assert not (home / ".local/share/gnome-shell/search-providers").exists()
     service = home / ".local/share/dbus-1/services" / f"{provider.APP_ID}.service"
-    assert f"Exec={home}/.local/bin/gnome-drive-search-provider" in service.read_text()
+    assert f"Exec={home}/.local/bin/gnome-google-workspace-search" in service.read_text()
 
     subprocess.run([str(ROOT / "uninstall.sh")], check=True, env=env, capture_output=True)
-    assert not ini.exists()
+    assert not any(ini.exists() for ini in inis)
     assert not service.exists()
+    assert not list((share / "applications").glob("*.desktop"))
+    assert not list((share / "icons/hicolor/scalable/apps").glob("*.svg"))
 
 
 def test_user_install_without_writable_data_dir_explains_the_sudo_step(tmp_path):
@@ -552,7 +565,7 @@ def test_account_without_drive_scope_is_disabled_after_the_first_403():
         raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, io.BytesIO(body))
 
     assert provider.drive_search(account, ["a"], dict(provider.DEFAULTS), opener=opener) == []
-    assert account.disabled
+    assert account.disabled_services == {"drive"}
 
 
 def test_other_403s_do_not_disable_the_account():
@@ -562,7 +575,7 @@ def test_other_403s_do_not_disable_the_account():
         raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, io.BytesIO(b"rate limit"))
 
     provider.drive_search(account, ["a"], dict(provider.DEFAULTS), opener=opener)
-    assert not account.disabled
+    assert not account.disabled_services
 
 
 def test_accounts_merges_sources_skips_duplicates_and_remembers_disabled(tmp_path, monkeypatch):
@@ -582,7 +595,7 @@ def test_accounts_merges_sources_skips_duplicates_and_remembers_disabled(tmp_pat
     assert [(a.identity, a.source) for a in found] == [
         ("me@gmail.com", "login"), ("me@work.com", "login"), ("other@old.com", "goa"),
     ]
-    found[2].disabled = True
+    found[2].disabled_services.add("drive")
     sp.invalidate_accounts()  # force a re-read, as happens every minute
     assert [a.identity for a in sp.accounts()] == ["me@gmail.com", "me@work.com"]
 
@@ -593,7 +606,7 @@ def test_search_all_queries_every_account_and_tags_results(monkeypatch):
         provider.Account(email, lambda: ("t", 3600))
         for email in ("me@gmail.com", "me@work.com", "broken@x.com")
     )
-    sp._accounts, sp._accounts_at = [personal, work, broken], float("inf")
+    sp.manager._accounts, sp.manager._accounts_at = [personal, work, broken], float("inf")
 
     def fake_search(account, terms, cfg, **kw):
         if account is broken:
@@ -785,6 +798,9 @@ def test_activate_result_passes_the_account_to_the_opener(monkeypatch):
 # Guided setup
 # ---------------------------------------------------------------------------
 
+# Answers to step 2 of --setup: Drive?, contents?, Gmail?, Calendar?, Contacts?
+DRIVE_ONLY = ["", "", "", "", ""]
+
 
 def setup_env(tmp_path, monkeypatch, answers, registered=True):
     """Isolated config dir, scripted answers, a fake login and a fake Drive."""
@@ -797,7 +813,7 @@ def setup_env(tmp_path, monkeypatch, answers, registered=True):
     monkeypatch.setattr(provider.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(provider, "goa_accounts", lambda: [])
     monkeypatch.setattr(provider, "provider_registration",
-                        lambda: "/usr/share/x.ini" if registered else None)
+                        lambda service=None: "/usr/share/p/x.ini" if registered else None)
     prompts, queue = [], list(answers)
 
     def fake_input(prompt):
@@ -810,13 +826,12 @@ def setup_env(tmp_path, monkeypatch, answers, registered=True):
     logins = []
     emails = iter(["me@gmail.com", "me@work.com"])
 
-    def fake_login(client_secret=None, fulltext=False, **kw):
-        email = next(emails)
-        logins.append((email, fulltext))
+    def fake_login(client_secret=None, scopes=None, login_hint=None, **kw):
+        email = login_hint or next(emails)
+        logins.append((email, scopes))
         client = provider.load_client_secret(provider.CLIENT_SECRET_PATH)
         payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
-        scope = provider.SCOPE_READONLY if fulltext else provider.SCOPE_METADATA
-        provider.save_account(email, client, payload, scope)
+        provider.save_account(email, client, payload, " ".join(scopes))
         return email
 
     monkeypatch.setattr(provider, "login", fake_login)
@@ -826,12 +841,25 @@ def setup_env(tmp_path, monkeypatch, answers, registered=True):
     return cfg_dir, prompts, queue, logins
 
 
+def run_setup_with_config():
+    return provider.run_setup(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH)
+
+
+def connect(cfg_dir, email, *scopes):
+    cfg_dir.mkdir(exist_ok=True)
+    secret = cfg_dir / "client_secret.json"
+    if not secret.exists():
+        write_client_secret(cfg_dir)
+    client = provider.load_client_secret(str(secret))
+    payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+    provider.save_account(email, client, payload, " ".join(scopes or [provider.SCOPE_METADATA]))
+
+
 def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path, monkeypatch, capsys):
     downloads = tmp_path / "Downloads"
     downloads.mkdir()
     secret = write_client_secret(downloads)
-    answers = [
-        "",          # search contents? default no
+    answers = DRIVE_ONLY + [
         "",          # client path: accept the one found in ~/Downloads
         "",          # add an account? default yes
         "y",         # add another?
@@ -839,61 +867,80 @@ def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path,
         "budget",    # test search
     ]
     cfg_dir, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
-    cfg = provider.load_config(provider.CONFIG_PATH)
 
-    assert provider.run_setup(cfg, provider.CONFIG_PATH) == 0
+    assert run_setup_with_config() == 0
     assert queue == []
-    assert str(secret) in prompts[1]  # the downloaded client was offered as default
-    assert logins == [("me@gmail.com", False), ("me@work.com", False)]
+    assert str(secret) in prompts[5]  # the downloaded client was offered as default
+    drive_only = [provider.SCOPE_EMAIL, provider.SCOPE_METADATA]
+    assert logins == [("me@gmail.com", drive_only), ("me@work.com", drive_only)]
     assert oct((cfg_dir / "client_secret.json").stat().st_mode & 0o777) == "0o600"
     out = capsys.readouterr().out
-    assert "Registered: /usr/share/x.ini" in out
+    assert "Registered in /usr/share/p" in out
+    assert "Google Drive: 2 result(s)" in out
     assert "Budget of me@gmail.com" in out and "Budget of me@work.com" in out
-    assert "2 result(s)." in out
+    assert "Gmail:" not in out.split("5. Test")[1]  # disabled services are not searched
 
 
 def test_setup_is_rerunnable_and_offers_nothing_destructive(tmp_path, monkeypatch, capsys):
     cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
-    cfg_dir.mkdir()
-    secret = write_client_secret(cfg_dir)
-    client = provider.load_client_secret(str(secret))
-    payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
-    provider.save_account("me@work.com", client, payload, provider.SCOPE_METADATA)
-    _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, ["", "", ""])
-    #                                    contents? no / add another? no / skip test
-
-    assert provider.run_setup(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 0
+    connect(cfg_dir, "me@work.com")
+    _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, DRIVE_ONLY + ["", ""])
+    #                                                      add another? no / skip the test
+    assert run_setup_with_config() == 0
     assert queue == [] and logins == []
     out = capsys.readouterr().out
     assert "OAuth client: ready" in out
     assert "- me@work.com" in out
-    assert "Add another account?" in prompts[1]
+    assert "Add another account?" in prompts[5]
 
 
-def test_setup_fulltext_is_saved_and_flags_accounts_with_names_only_access(tmp_path, monkeypatch, capsys):
+def test_setup_enabling_gmail_reauthorizes_existing_accounts(tmp_path, monkeypatch, capsys):
     cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
-    cfg_dir.mkdir()
-    client = provider.load_client_secret(str(write_client_secret(cfg_dir)))
-    payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
-    provider.save_account("old@work.com", client, payload, provider.SCOPE_METADATA)
+    connect(cfg_dir, "me@work.com")
     (cfg_dir / "config.ini").write_text("[search]\nmax_results = 4\n")
-    _, _, queue, logins = setup_env(tmp_path, monkeypatch, ["y", "y", "", ""])
-    #                               contents? yes / add another? yes / another? no / skip test
+    answers = ["", "", "y", "", "",   # Drive yes, names only, Gmail YES, Calendar no, Contacts no
+               "",                    # authorize Gmail for me@work.com now? default yes
+               "", ""]                # add another? no / skip the test
+    _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
+    monkeypatch.setattr(provider.GmailService, "search", lambda self, account, terms, cfg: [])
 
-    assert provider.run_setup(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 0
-    assert logins == [("me@gmail.com", True)]
+    assert run_setup_with_config() == 0
+    assert queue == []
+    assert "has not authorized Gmail" in prompts[5]
+    assert logins == [("me@work.com",
+                       [provider.SCOPE_EMAIL, provider.SCOPE_METADATA, provider.SCOPE_GMAIL])]
     saved = provider.load_config(provider.CONFIG_PATH)
-    assert saved["mode"] == "fulltext" and saved["max_results"] == 4  # other keys survive
-    assert "log in to them again to search contents: old@work.com" in capsys.readouterr().out
+    assert saved["services"] == {"drive": True, "gmail": True, "calendar": False, "contacts": False}
+    assert saved["max_results"] == 4  # keys the setup does not own survive
+    assert "read access to ALL your mail" in capsys.readouterr().out
+
+
+def test_setup_fulltext_is_saved_and_asks_for_read_access(tmp_path, monkeypatch):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    connect(cfg_dir, "old@work.com")
+    answers = ["", "y", "", "", "",   # Drive yes, contents YES
+               "n",                   # authorize now? no
+               "", ""]
+    _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
+    assert run_setup_with_config() == 1  # the only account cannot search contents yet
+    assert "has not authorized Google Drive" in prompts[5] and logins == []
+    assert provider.load_config(provider.CONFIG_PATH)["mode"] == "fulltext"
+
+
+def test_setup_with_nothing_enabled_stops(tmp_path, monkeypatch, capsys):
+    _, _, queue, logins = setup_env(tmp_path, monkeypatch, ["n", "", "", ""])
+    assert run_setup_with_config() == 1
+    assert queue == [] and logins == []
+    assert "Nothing enabled" in capsys.readouterr().out
 
 
 def test_setup_without_a_client_stops_before_login(tmp_path, monkeypatch, capsys):
-    _, _, queue, logins = setup_env(tmp_path, monkeypatch, ["", "/nope.json", ""], registered=False)
-    #                               contents? no / bad path / give up
-    assert provider.run_setup(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 1
+    answers = DRIVE_ONLY + ["/nope.json", ""]  # bad path, then give up
+    _, _, queue, logins = setup_env(tmp_path, monkeypatch, answers, registered=False)
+    assert run_setup_with_config() == 1
     assert queue == [] and logins == []
     out = capsys.readouterr().out
-    assert "Not registered" in out
+    assert "Not registered" in out and "Google Contacts" in out
     assert "no OAuth client found at /nope.json" in out
     assert "No usable account" in out
 
@@ -911,7 +958,7 @@ def test_setup_survives_ctrl_c(tmp_path, monkeypatch, capsys):
         raise KeyboardInterrupt
 
     monkeypatch.setattr("builtins.input", interrupt)
-    assert provider.run_setup(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 130
+    assert run_setup_with_config() == 130
     assert "Run it again any time" in capsys.readouterr().out
 
 
@@ -939,3 +986,287 @@ def test_invalidate_accounts_rereads_even_right_after_boot(tmp_path, monkeypatch
     assert sp.accounts() == []  # still cached
     sp.invalidate_accounts()
     assert [a.identity for a in sp.accounts()] == ["new@x.com"]
+
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+
+
+def all_on():
+    cfg = dict(provider.DEFAULTS)
+    cfg["services"] = dict.fromkeys(provider.DEFAULTS["services"], True)
+    return cfg
+
+
+def fake_api(monkeypatch, routes):
+    """Answer api_get by URL substring; records the URLs requested."""
+    seen = []
+
+    def fake_urlopen(req, timeout=0):
+        seen.append(req.full_url)
+        for fragment, answer in routes:
+            if fragment in req.full_url:
+                if isinstance(answer, Exception):
+                    raise answer
+                return FakeResponse(json.dumps(answer).encode())
+        raise AssertionError(f"unexpected request: {req.full_url}")
+
+    monkeypatch.setattr(provider.urllib.request, "urlopen", fake_urlopen)
+    return seen
+
+
+def http_error(code, body):
+    return urllib.error.HTTPError("https://x", code, "err", {}, io.BytesIO(body.encode()))
+
+
+def test_only_drive_is_enabled_by_default_and_config_can_change_it(tmp_path):
+    assert [s.key for s in provider.enabled_services(provider.load_config(str(tmp_path / "x")))] == ["drive"]
+    ini = tmp_path / "config.ini"
+    ini.write_text("[services]\ndrive = no\ngmail = yes\n")
+    cfg = provider.load_config(str(ini))
+    assert [s.key for s in provider.enabled_services(cfg)] == ["gmail"]
+    assert provider.DEFAULTS["services"]["gmail"] is False  # defaults are not mutated
+
+
+def test_login_scopes_cover_exactly_the_enabled_services():
+    cfg = dict(provider.DEFAULTS)
+    assert provider.login_scopes(cfg) == [provider.SCOPE_EMAIL, provider.SCOPE_METADATA]
+    cfg = all_on()
+    cfg["mode"] = "fulltext"
+    assert provider.login_scopes(cfg) == [
+        provider.SCOPE_EMAIL, provider.SCOPE_READONLY, provider.SCOPE_GMAIL,
+        provider.SCOPE_CALENDAR, provider.SCOPE_CONTACTS, provider.SCOPE_OTHER_CONTACTS,
+        provider.SCOPE_DIRECTORY,
+    ]
+
+
+def test_a_service_only_searches_accounts_that_granted_it(monkeypatch):
+    cfg = all_on()
+    drive_only = provider.Account("a@x.com", lambda: ("t", 3600), scopes=[provider.SCOPE_METADATA])
+    with_mail = provider.Account("b@x.com", lambda: ("t", 3600),
+                                 scopes=[provider.SCOPE_READONLY, provider.SCOPE_GMAIL])
+    unknown = provider.Account("token.json", lambda: ("t", 3600), source="token_file")
+    manager = provider.AccountManager(cfg)
+    manager._accounts, manager._accounts_at = [drive_only, with_mail, unknown], float("inf")
+
+    def usable(key):
+        sp = provider.SearchProvider(None, cfg, provider.SERVICES_BY_KEY[key], manager)
+        return [a.identity for a in sp.accounts()]
+
+    assert usable("drive") == ["a@x.com", "b@x.com", "token.json"]
+    assert usable("gmail") == ["b@x.com", "token.json"]   # unknown scopes: try, then learn
+    assert usable("calendar") == ["token.json"]
+    cfg["mode"] = "fulltext"
+    assert usable("drive") == ["b@x.com", "token.json"]   # names-only access is not enough
+    cfg["services"]["gmail"] = False
+    assert usable("gmail") == []
+
+
+def test_api_get_disables_a_service_only_for_permanent_refusals():
+    cases = [
+        (403, "Request had insufficient authentication scopes.", True),
+        (403, '{"error": {"status": "PERMISSION_DENIED", "reason": "SERVICE_DISABLED"}}', True),
+        (403, "Gmail API has not been used in project 123 before or it is disabled.", True),
+        (403, "User rate limit exceeded", False),
+        (500, "backend error", False),
+    ]
+    for code, body, disabled in cases:
+        account = make_account(["t"])
+        result = provider.api_get(account, "https://x", "gmail",
+                                  opener=lambda req, timeout=0, c=code, b=body: (_ for _ in ()).throw(
+                                      http_error(c, b)))
+        assert result is None
+        assert ("gmail" in account.disabled_services) is disabled, body
+
+
+def test_gmail_search_fetches_headers_groups_threads_and_builds_links(monkeypatch):
+    seen = fake_api(monkeypatch, [
+        ("/messages?", {"messages": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}]}),
+        ("/messages/m1?", {"id": "m1", "threadId": "t1", "internalDate": "1767268800000",
+                           "labelIds": ["UNREAD"], "payload": {"headers": [
+                               {"name": "Subject", "value": "Invoice 42"},
+                               {"name": "From", "value": "Ana Perez <ana@x.com>"}]}}),
+        ("/messages/m2?", {"id": "m2", "threadId": "t1", "internalDate": "1767268900000",
+                           "payload": {"headers": []}}),
+        ("/messages/m3?", {"id": "m3", "threadId": "t3", "internalDate": "1767355200000",
+                           "payload": {"headers": [{"name": "From", "value": "bot@x.com"}]}}),
+    ])
+    gmail = provider.SERVICES_BY_KEY["gmail"]
+    items = gmail.sort(gmail.search(make_account(["t"] * 9), ["from:ana", "invoice"], all_on()))
+    assert "q=from%3Aana+invoice" in seen[0]          # Gmail operators pass through untouched
+    assert "format=metadata" in seen[1] and "metadataHeaders=Subject" in seen[1]
+    assert [i["id"] for i in items] == ["t3", "t1"]   # newest first, one entry per thread
+    assert gmail.meta(items[1], "en")[:2] == ("Invoice 42", ["Ana Perez", "2026-01-01"])
+    assert gmail.meta(items[0], "es")[0] == "(sin asunto)"
+    assert gmail.meta(items[0], "en")[1][0] == "bot@x.com"
+    url = provider.account_url(gmail.url(items[1]), "me@work.com")
+    assert url == "https://mail.google.com/mail/?authuser=me%40work.com#all/t1"
+    assert gmail.search_url(["a b"]) == "https://mail.google.com/mail/#search/a%20b"
+
+
+def test_gmail_search_with_no_matches_makes_one_request(monkeypatch):
+    seen = fake_api(monkeypatch, [("/messages?", {"resultSizeEstimate": 0})])
+    assert provider.SERVICES_BY_KEY["gmail"].search(make_account(["t"]), ["zzz"], all_on()) == []
+    assert len(seen) == 1
+
+
+def test_calendar_shows_upcoming_events_first_then_recent_past(monkeypatch):
+    def event(eid, start, **extra):
+        key = "dateTime" if "T" in start else "date"
+        return {"id": eid, "summary": eid.title(), "start": {key: start},
+                "htmlLink": f"https://calendar.google.com/event?eid={eid}", **extra}
+
+    seen = fake_api(monkeypatch, [
+        ("timeMax=", {"items": [event("older", "2026-08-01T10:00:00-03:00"),
+                                event("recent", "2026-09-10")]}),
+        ("timeMin=", {"items": [event("soon", "2026-09-25T15:30:00-03:00", location="Room 1"),
+                                event("later", "2026-10-02T09:00:00-03:00")]}),
+    ])
+    calendar = provider.SERVICES_BY_KEY["calendar"]
+    items = calendar.sort(calendar.search(make_account(["t"] * 4), ["sync"], all_on()))
+    assert [i["id"] for i in items] == ["soon", "later", "recent", "older"]
+    assert "singleEvents=true" in seen[0] and "orderBy=startTime" in seen[0] and "q=sync" in seen[0]
+    assert calendar.meta(items[0], "en") == ("Soon", ["2026-09-25 15:30", "Room 1"], calendar.icon)
+    assert calendar.meta(items[2], "en")[1] == ["2026-09-10", ""]  # all-day event
+    assert calendar.url(items[0]).endswith("eid=soon")
+
+
+def test_calendar_skips_the_past_when_upcoming_fills_the_page(monkeypatch):
+    cfg = dict(all_on(), max_results=1)
+    seen = fake_api(monkeypatch, [("timeMin=", {"items": [
+        {"id": "e", "start": {"date": "2026-12-01"}}]})])
+    assert len(provider.SERVICES_BY_KEY["calendar"].search(make_account(["t"]), ["x"], cfg)) == 1
+    assert len(seen) == 1
+
+
+def test_contacts_merges_own_contacts_and_directory(monkeypatch):
+    def person(rid, name, mail, **extra):
+        return {"resourceName": rid, "names": [{"displayName": name}],
+                "emailAddresses": [{"value": mail}], **extra}
+
+    ana = person("people/c1", "Ana Perez", "ana@work.com", phoneNumbers=[{"value": "+56 9 1"}],
+                 organizations=[{"title": "CFO", "name": "Acme"}])
+    seen = fake_api(monkeypatch, [
+        ("people:searchContacts", {"results": [{"person": ana}]}),
+        ("otherContacts:search", {"results": [
+            {"person": person("otherContacts/c9", "Carla Soto", "carla@client.com")}]}),
+        ("people:searchDirectoryPeople", {"people": [
+            person("people/999", "Ana Perez", "ANA@work.com"),      # same person, from the directory
+            person("people/777", "Bruno Diaz", "bruno@work.com")]}),
+    ])
+    contacts = provider.SERVICES_BY_KEY["contacts"]
+    account = make_account(["t"] * 9)
+    items = contacts.sort(contacts.search(account, ["an"], all_on()))
+    assert [i["name"] for i in items] == ["Ana Perez", "Bruno Diaz", "Carla Soto"]
+    assert seen[0].endswith("query=")                 # warm-up request, as Google asks
+    assert contacts.url(items[2]) == "https://contacts.google.com/person/c9"
+    assert contacts.meta(items[0], "en") == (
+        "Ana Perez", ["ana@work.com", "+56 9 1", "CFO, Acme"], contacts.icon)
+    assert contacts.url(items[0]) == "https://contacts.google.com/person/c1"
+    contacts.search(account, ["br"], all_on())
+    assert sum(u.endswith("query=") for u in seen) == 2  # one warm-up per searchable source, once
+
+
+def test_contacts_stops_asking_for_a_directory_that_does_not_exist(monkeypatch):
+    seen = fake_api(monkeypatch, [
+        ("people:searchContacts", {"results": []}),
+        ("otherContacts:search", {"results": []}),
+        ("people:searchDirectoryPeople", http_error(400, "Must be a G Suite domain user.")),
+    ])
+    contacts = provider.SERVICES_BY_KEY["contacts"]
+    account = make_account(["t"] * 9)
+    assert contacts.search(account, ["ana"], all_on()) == []
+    assert account.disabled_services == {"directory"}
+    assert contacts.usable(account, all_on())  # own contacts keep working
+    before = len(seen)
+    contacts.search(account, ["ana"], all_on())
+    assert not any("Directory" in u for u in seen[before:])
+    # Accounts that never granted the optional scopes are not asked for them at all.
+    personal = provider.Account("me@gmail.com", lambda: ("t", 3600), scopes=[provider.SCOPE_CONTACTS])
+    before = len(seen)
+    contacts.search(personal, ["ana"], all_on())
+    assert all("people:searchContacts" in u for u in seen[before:])
+
+
+def test_each_provider_answers_dbus_with_its_own_service(monkeypatch):
+    cfg = dict(all_on(), debounce_ms=1)
+    manager = provider.AccountManager(cfg)
+    manager._accounts, manager._accounts_at = [make_account(["t"] * 9)], float("inf")
+    gmail = provider.SearchProvider(GLib.MainLoop(), cfg, provider.SERVICES_BY_KEY["gmail"], manager)
+    gmail.lang = "en"
+    monkeypatch.setattr(provider.GmailService, "search", lambda self, account, terms, cfg: [
+        {"id": "t1", "subject": "Hello", "from": "Ana <a@x.com>", "date": 1767268800000}])
+    inv = FakeInvocation()
+    gmail.handle_call(None, None, None, None, "GetInitialResultSet", GLib.Variant("(as)", (["hello"],)), inv)
+    pump()
+    assert inv.value == (["t1"],)
+    metas = FakeInvocation()
+    gmail.GetResultMetas(GLib.Variant("(as)", (["t1"],)), metas)
+    assert metas.value[0][0] == {"id": "t1", "name": "Hello", "description": "Ana - 2026-01-01",
+                                 "gicon": f"{provider.APP_ID}.Gmail"}
+    opened = []
+    monkeypatch.setattr(gmail, "_open", lambda url, email=None: opened.append(url))
+    gmail.ActivateResult(GLib.Variant("(sasu)", ("t1", [], 0)), FakeInvocation())
+    gmail.LaunchSearch(GLib.Variant("(asu)", (["hello"], 0)), FakeInvocation())
+    assert opened == ["https://mail.google.com/mail/?authuser=me%40example.com#all/t1",
+                      "https://mail.google.com/mail/#search/hello"]
+
+
+def test_disabled_service_answers_immediately_with_nothing(monkeypatch):
+    cfg = dict(provider.DEFAULTS, services=dict(provider.DEFAULTS["services"]))
+    manager = provider.AccountManager(cfg)
+    manager._accounts, manager._accounts_at = [make_account(["t"])], float("inf")
+    gmail = provider.SearchProvider(None, cfg, provider.SERVICES_BY_KEY["gmail"], manager)
+    monkeypatch.setattr(provider.GmailService, "search",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("must not search")))
+    inv = FakeInvocation()
+    gmail.GetInitialResultSet(GLib.Variant("(as)", (["hello"],)), inv)
+    assert inv.value == ([],)
+
+
+def test_results_are_capped_after_merging_accounts(monkeypatch):
+    sp = make_provider(monkeypatch, [{"id": str(i), "name": "f", "modifiedTime": f"2026-01-{i:02d}"}
+                                     for i in range(1, 9)], max_results=3)
+    inv = FakeInvocation()
+    sp.GetInitialResultSet(GLib.Variant("(as)", (["abc"],)), inv)
+    pump()
+    assert inv.value == (["8", "7", "6"],)
+
+
+def test_fetch_email_falls_back_across_apis(monkeypatch):
+    fake_api(monkeypatch, [
+        ("drive/v3/about", http_error(403, "insufficient")),
+        ("/profile", {"emailAddress": "me@gmail.com"}),
+    ])
+    assert provider.fetch_email("token") == "me@gmail.com"
+    fake_api(monkeypatch, [("drive/v3/about", http_error(403, "x")), ("/profile", http_error(403, "x")),
+                           ("userinfo", http_error(401, "x"))])
+    with pytest.raises(provider.LoginError, match="which account"):
+        provider.fetch_email("token")
+
+
+def test_accounts_listing_says_what_each_account_can_search(tmp_path, monkeypatch, capsys):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    connect(cfg_dir, "a@x.com")
+    connect(cfg_dir, "b@x.com", provider.SCOPE_METADATA, provider.SCOPE_GMAIL)
+    cfg = provider.load_config(provider.CONFIG_PATH)
+    cfg["services"]["gmail"] = True
+    assert provider.run_accounts(cfg) == 0
+    out = capsys.readouterr().out
+    assert "a@x.com  (--login)  searches: Google Drive\n    not authorized for: Gmail" in out
+    assert "b@x.com  (--login)  searches: Google Drive, Gmail\n" in out
+
+
+def test_legacy_config_dir_is_migrated_once(tmp_path, monkeypatch):
+    old, new = tmp_path / "gnome-drive-search-provider", tmp_path / "gnome-google-workspace-search"
+    (old / "accounts").mkdir(parents=True)
+    (old / "accounts" / "me@x.com.json").write_text("{}")
+    monkeypatch.setattr(provider, "LEGACY_CONFIG_DIR", str(old))
+    monkeypatch.setattr(provider, "CONFIG_DIR", str(new))
+    provider.migrate_legacy_config()
+    assert (new / "accounts" / "me@x.com.json").exists() and not old.exists()
+    old.mkdir()
+    (old / "stale").write_text("")
+    provider.migrate_legacy_config()  # never overwrites the new directory
+    assert not (new / "stale").exists() and old.exists()

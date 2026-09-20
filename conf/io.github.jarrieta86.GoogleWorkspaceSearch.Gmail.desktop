@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Gmail
+Comment=Search Gmail messages from the Activities overview
+Comment[es]=Buscar correos de Gmail desde la vista de Actividades
+Exec=xdg-open https://mail.google.com/
+Icon=io.github.jarrieta86.GoogleWorkspaceSearch.Gmail
+Terminal=false
+Categories=GNOME;Network;
+OnlyShowIn=GNOME;

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""GNOME Shell search provider for Google Drive.
+"""GNOME Shell search providers for Google Workspace.
 
-Implements org.gnome.Shell.SearchProvider2 over D-Bus so that typing in the
-Activities overview searches the files in your Google Drive.
+One D-Bus service exports a search provider (org.gnome.Shell.SearchProvider2)
+per Google service: Drive, Gmail, Calendar and Contacts. Each one shows up as its
+own section in the Activities overview and can be switched on and off, both here
+(``--setup``) and in Settings > Search. Only Drive is enabled by default, and an
+account is only ever asked for the permissions of the services you enable.
 
-Accounts are added with ``--login``, which runs the OAuth flow in your browser
-using your own OAuth client and stores one token file per account under
-``~/.config/gnome-drive-search-provider/accounts``. Every logged-in account is
-searched. Two more sources are supported for compatibility:
+Accounts are added with ``--setup`` or ``--login``, which run the OAuth flow in
+your browser using your own OAuth client and store one token file per account
+under ``~/.config/gnome-google-workspace-search/accounts``. Every account is
+searched, in parallel. Two more account sources exist for compatibility:
 
 - ``auth.token_file``: an existing "authorized_user" JSON token (google-auth).
 - GNOME Online Accounts, on the old GNOME releases whose Google tokens still
-  carry a Drive scope. Current releases do not, and such accounts are skipped.
+  carry the needed scopes. Current releases do not, and such accounts are skipped.
 
 The process is started on demand by D-Bus activation and exits after a period
 of inactivity.
@@ -21,6 +24,7 @@ import argparse
 import base64
 import concurrent.futures
 import configparser
+import email.utils
 import hashlib
 import http.server
 import json
@@ -44,7 +48,7 @@ gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import Gio, GLib
 
-APP_ID = "io.github.jarrieta86.DriveSearchProvider"
+APP_ID = "io.github.jarrieta86.GoogleWorkspaceSearch"
 BUS_NAME = APP_ID
 OBJECT_PATH = "/" + APP_ID.replace(".", "/")
 
@@ -56,6 +60,10 @@ GOA_OAUTH2_IFACE = "org.gnome.OnlineAccounts.OAuth2Based"
 DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 DRIVE_FIELDS = "files(id,name,mimeType,webViewLink,modifiedTime,owners(displayName))"
 DRIVE_ABOUT_URL = "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)"
+GMAIL_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
+CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+PEOPLE_URL = "https://people.googleapis.com/v1"
+USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
@@ -63,8 +71,18 @@ REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 # Least privilege: file names and metadata only. Full-text search needs read access.
 SCOPE_METADATA = "https://www.googleapis.com/auth/drive.metadata.readonly"
 SCOPE_READONLY = "https://www.googleapis.com/auth/drive.readonly"
+SCOPE_DRIVE = "https://www.googleapis.com/auth/drive"
+SCOPE_GMAIL = "https://www.googleapis.com/auth/gmail.readonly"
+SCOPE_CALENDAR = "https://www.googleapis.com/auth/calendar.events.readonly"
+SCOPE_CONTACTS = "https://www.googleapis.com/auth/contacts.readonly"
+SCOPE_DIRECTORY = "https://www.googleapis.com/auth/directory.readonly"
+SCOPE_OTHER_CONTACTS = "https://www.googleapis.com/auth/contacts.other.readonly"
+# Lets us label the account without depending on any particular service.
+SCOPE_EMAIL = "https://www.googleapis.com/auth/userinfo.email"
 
-CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "gnome-drive-search-provider")
+LEGACY_CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "gnome-drive-search-provider")
+
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "gnome-google-workspace-search")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.ini")
 ACCOUNTS_DIR = os.path.join(CONFIG_DIR, "accounts")
 CLIENT_SECRET_PATH = os.path.join(CONFIG_DIR, "client_secret.json")
@@ -94,6 +112,7 @@ DEFAULTS = {
     "shared_drives": True,
     "idle_exit_seconds": 300,
     "token_file": "",
+    "services": {"drive": True, "gmail": False, "calendar": False, "contacts": False},
     "use_profiles": True,
     "profiles": {},  # manual overrides: account email -> browser profile directory
 }
@@ -143,6 +162,7 @@ LABELS = {
         "pdf": "PDF", "word": "Word", "excel": "Excel", "powerpoint": "PowerPoint",
         "text": "Text", "csv": "CSV", "image": "Image", "video": "Video", "audio": "Audio",
         "file": "File",
+        "no_subject": "(no subject)", "no_title": "(no title)",
     },
     "es": {
         "document": "Documento", "spreadsheet": "Hoja de cálculo", "presentation": "Presentación",
@@ -150,6 +170,7 @@ LABELS = {
         "pdf": "PDF", "word": "Word", "excel": "Excel", "powerpoint": "PowerPoint",
         "text": "Texto", "csv": "CSV", "image": "Imagen", "video": "Video", "audio": "Audio",
         "file": "Archivo",
+        "no_subject": "(sin asunto)", "no_title": "(sin título)",
     },
 }
 
@@ -187,7 +208,7 @@ VERBOSE = False
 
 def log(msg, always=False):
     if VERBOSE or always:
-        print(f"[gnome-drive-search-provider] {msg}", file=sys.stderr, flush=True)
+        print(f"[gnome-google-workspace-search] {msg}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +242,14 @@ def load_config(path=CONFIG_PATH):
     read(search, "shared_drives", boolean)
     read(search, "idle_exit_seconds", int)
     read(auth, "token_file", str)
+    if parser.has_section("services"):
+        services = dict(cfg["services"])
+        for key in services:
+            if key in parser["services"]:
+                services[key] = boolean(parser["services"][key])
+        cfg["services"] = services
+    else:
+        cfg["services"] = dict(cfg["services"])
     browser = parser["browser"] if parser.has_section("browser") else {}
     read(browser, "use_profiles", boolean)
     if parser.has_section("browser_profiles"):
@@ -266,11 +295,13 @@ def kind_label(mime, lang):
 class Account:
     """A Google account we can search, with a way to get a fresh access token."""
 
-    def __init__(self, identity, token_getter, source="login"):
+    def __init__(self, identity, token_getter, source="login", scopes=None):
         self.identity = identity
         self.source = source
-        # Set when Google says the token cannot access Drive, so we stop asking.
-        self.disabled = False
+        # Granted OAuth scopes when known (token files record them); None = unknown.
+        self.scopes = set(scopes) if scopes else None
+        # Services Google refused for this account, so we stop asking.
+        self.disabled_services = set()
         self._token_getter = token_getter
         self._token = None
         self._expires_at = 0.0
@@ -358,7 +389,17 @@ class TokenFile:
         if not self.path or not os.path.exists(self.path):
             return None
         identity = self.identity or os.path.basename(self.path)
-        return Account(identity, self.fresh_token, source=self.source)
+        return Account(identity, self.fresh_token, source=self.source, scopes=self._scopes())
+
+    def _scopes(self):
+        try:
+            with open(self.path) as f:
+                scopes = json.load(f).get("scopes")
+        except (OSError, ValueError):
+            return None
+        if isinstance(scopes, str):
+            scopes = scopes.split()
+        return scopes or None
 
     def _load(self):
         with open(self.path) as f:
@@ -469,6 +510,8 @@ def build_auth_url(client, redirect_uri, scope, state, challenge, login_hint=Non
         "response_type": "code",
         "scope": scope,
         "access_type": "offline",
+        # Keep what the account already granted when enabling one more service.
+        "include_granted_scopes": "true",
         # Always ask for consent so Google returns a refresh token every time.
         "prompt": "consent select_account",
         "state": state,
@@ -505,18 +548,26 @@ def exchange_code(client, code, verifier, redirect_uri):
 
 
 def fetch_email(access_token):
-    req = urllib.request.Request(
-        DRIVE_ABOUT_URL, headers={"Authorization": f"Bearer {access_token}"}
+    """Address of the account behind a token, asking whichever API it can use."""
+    sources = (
+        (DRIVE_ABOUT_URL, lambda d: d["user"]["emailAddress"]),
+        (GMAIL_URL + "/profile", lambda d: d["emailAddress"]),
+        (USERINFO_URL, lambda d: d["email"]),
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.load(resp)["user"]["emailAddress"]
-    except urllib.error.HTTPError as e:
-        detail = e.read()[:300].decode(errors="replace")
-        raise LoginError(
-            f"logged in, but Drive refused the token (HTTP {e.code}). Is the Google Drive "
-            f"API enabled in your Google Cloud project? {detail}"
-        ) from None
+    detail = ""
+    for url, pick in sources:
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return pick(json.load(resp))
+        except urllib.error.HTTPError as e:
+            detail = f"HTTP {e.code}: " + e.read()[:300].decode(errors="replace")
+        except (KeyError, TypeError, ValueError):
+            detail = f"unexpected answer from {url}"
+    raise LoginError(
+        "logged in, but Google would not say which account this is. Are the APIs of the "
+        f"services you enabled switched on in your Google Cloud project? {detail}"
+    )
 
 
 def wait_for_redirect(server, state, timeout):
@@ -606,18 +657,21 @@ def stored_accounts(accounts_dir=None):
 
 
 def login(client_secret=None, fulltext=False, port=0, open_browser=True, timeout=300,
-          accounts_dir=None, client_secret_store=None):
-    """Add (or re-authorize) a Google account. Returns its email."""
+          accounts_dir=None, client_secret_store=None, scopes=None, login_hint=None):
+    """Add (or re-authorize) a Google account. Returns its email.
+
+    scopes lists what to ask for; without it, Drive alone (contents too with fulltext).
+    """
     store = client_secret_store or CLIENT_SECRET_PATH
     client = load_client_secret(client_secret or store)
-    scope = SCOPE_READONLY if fulltext else SCOPE_METADATA
+    scope = " ".join(scopes) if scopes else (SCOPE_READONLY if fulltext else SCOPE_METADATA)
     verifier, challenge = pkce_pair()
     state = secrets.token_urlsafe(16)
 
     server = http.server.HTTPServer(("127.0.0.1", port), http.server.BaseHTTPRequestHandler)
     try:
         redirect_uri = f"http://127.0.0.1:{server.server_port}"
-        url = build_auth_url(client, redirect_uri, scope, state, challenge)
+        url = build_auth_url(client, redirect_uri, scope, state, challenge, login_hint)
         print("Open this link in the browser profile of the account you want to add:\n")
         print(f"  {url}\n")
         if client["kind"] == "web" and not port:
@@ -661,8 +715,63 @@ def logout(email, accounts_dir=None):
 
 
 # ---------------------------------------------------------------------------
-# Drive API
+# Google APIs
 # ---------------------------------------------------------------------------
+
+
+def api_get(account, url, service_key, opener=None, disable_on_error=False):
+    """GET a Google API as JSON with the account's token; None when it fails.
+
+    A 403 that will not fix itself (missing permission, API not enabled in the
+    OAuth client's project) switches the service off for the account, so one bad
+    combination does not cost a failing request on every keystroke.
+    """
+    opener = opener or urllib.request.urlopen
+    for attempt in (0, 1):
+        token = account.token(force=attempt == 1)
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            with opener(req, timeout=10) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and attempt == 0:
+                continue
+            body = e.read()[:600].decode(errors="replace")
+            lowered = body.lower()
+            if e.code == 403 and "insufficient" in lowered:
+                account.disabled_services.add(service_key)
+                hint = ("GNOME Online Accounts no longer grants this access; use --setup instead"
+                        if account.source == "goa" else "run --setup to authorize it again")
+                log(f"[{account.identity}] token lacks the permission for {service_key}, "
+                    f"skipping it for this account: {hint}", always=True)
+            elif e.code == 403 and ("accessnotconfigured" in lowered or "service_disabled" in lowered
+                                    or "has not been used in project" in lowered):
+                account.disabled_services.add(service_key)
+                log(f"[{account.identity}] the API behind {service_key} is not enabled in the Google "
+                    "Cloud project of your OAuth client (APIs & Services > Library); skipping it",
+                    always=True)
+            elif disable_on_error:
+                account.disabled_services.add(service_key)
+                log(f"[{account.identity}] {service_key} is not available for this account "
+                    f"(HTTP {e.code}), skipping it")
+            else:
+                log(f"[{account.identity}] {service_key}: HTTP {e.code}: {body[:200]!r}", always=True)
+            return None
+    return None
+
+
+def account_url(url, email):
+    """Make the browser open the link as the account that found it."""
+    if not email:
+        return url
+    parts = urllib.parse.urlsplit(url)
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+             if k != "authuser"]
+    query.append(("authuser", email))
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
+# -- Drive --------------------------------------------------------------------
 
 
 def escape_term(term):
@@ -694,40 +803,332 @@ def build_params(terms, cfg):
     return params
 
 
-def drive_search(account, terms, cfg, opener=urllib.request.urlopen):
+def drive_search(account, terms, cfg, opener=None):
     url = DRIVE_FILES_URL + "?" + urllib.parse.urlencode(build_params(terms, cfg))
-    for attempt in (0, 1):
-        token = account.token(force=attempt == 1)
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-        try:
-            with opener(req, timeout=10) as resp:
-                return json.load(resp).get("files", [])
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and attempt == 0:
-                continue
-            body = e.read()[:400].decode(errors="replace")
-            if e.code == 403 and "insufficient" in body.lower():
-                account.disabled = True
-                hint = ("GNOME Online Accounts no longer grants Drive access; use --login instead"
-                        if account.source == "goa" else
-                        "log in again, adding --fulltext if you use mode = fulltext")
-                log(f"[{account.identity}] token lacks the Drive permission for this search, "
-                    f"skipping this account: {hint}", always=True)
-            else:
-                log(f"[{account.identity}] HTTP {e.code}: {body[:200]!r}", always=True)
+    return (api_get(account, url, "drive", opener) or {}).get("files", [])
+
+
+# ---------------------------------------------------------------------------
+# Services: one search provider section each
+# ---------------------------------------------------------------------------
+
+
+class Service:
+    """What the generic provider needs to know about one Google service."""
+
+    key = ""            # config key and log label
+    object_name = ""    # D-Bus object path suffix, also the conf file suffix
+    label = ""
+    permission = ""     # shown in --setup before the user enables it
+    api = ""            # name of the API to enable in Google Cloud
+    request_scopes = ()
+    accepted_scopes = ()
+
+    @property
+    def icon(self):
+        return f"{APP_ID}.{self.object_name}"
+
+    def scopes(self, cfg):
+        """Scopes to request at login."""
+        return list(self.request_scopes)
+
+    def accepted(self, cfg):
+        """Any one of these granted scopes is enough to search."""
+        return set(self.accepted_scopes)
+
+    def usable(self, account, cfg):
+        if self.key in account.disabled_services:
+            return False
+        return account.scopes is None or bool(account.scopes & self.accepted(cfg))
+
+    def search(self, account, terms, cfg):
+        raise NotImplementedError
+
+    def item_id(self, item):
+        return item["id"]
+
+    def sort(self, items):
+        return items
+
+    def meta(self, item, lang):
+        """(name, description parts, icon name) of a result."""
+        raise NotImplementedError
+
+    def url(self, item):
+        raise NotImplementedError
+
+    def fallback_url(self, item_id):
+        return self.home_url
+
+    def search_url(self, terms):
+        raise NotImplementedError
+
+
+class DriveService(Service):
+    key, object_name, label = "drive", "Drive", "Google Drive"
+    permission = "file names, owners and dates (contents only if you ask for it)"
+    api = "Google Drive API"
+    home_url = "https://drive.google.com/"
+
+    def scopes(self, cfg):
+        return [SCOPE_READONLY if cfg["mode"] == "fulltext" else SCOPE_METADATA]
+
+    def accepted(self, cfg):
+        full = {SCOPE_READONLY, SCOPE_DRIVE}
+        return full if cfg["mode"] == "fulltext" else full | {SCOPE_METADATA}
+
+    def search(self, account, terms, cfg):
+        return drive_search(account, terms, cfg)
+
+    def sort(self, items):
+        return sorted(items, key=lambda f: f.get("modifiedTime", ""), reverse=True)
+
+    def meta(self, item, lang):
+        mime = item.get("mimeType", "")
+        owner = ", ".join(o.get("displayName", "") for o in item.get("owners", []) if o)
+        when = (item.get("modifiedTime") or "")[:10]
+        name = item.get("name", item["id"])
+        return name, [kind_label(mime, lang), owner, when], ICONS.get(mime, "text-x-generic")
+
+    def url(self, item):
+        return item.get("webViewLink") or self.fallback_url(item["id"])
+
+    def fallback_url(self, item_id):
+        return f"https://drive.google.com/open?id={item_id}"
+
+    def search_url(self, terms):
+        return "https://drive.google.com/drive/search?q=" + urllib.parse.quote(" ".join(terms))
+
+
+class GmailService(Service):
+    key, object_name, label = "gmail", "Gmail", "Gmail"
+    permission = "read access to ALL your mail (Google has no narrower permission that can search)"
+    api = "Gmail API"
+    home_url = "https://mail.google.com/"
+    request_scopes = (SCOPE_GMAIL,)
+    accepted_scopes = (SCOPE_GMAIL, "https://www.googleapis.com/auth/gmail.modify",
+                       "https://mail.google.com/")
+    HEADERS = ("Subject", "From", "Date")
+
+    def search(self, account, terms, cfg):
+        # Terms go to Gmail untouched, so its operators work: from:ana has:attachment
+        params = {"q": " ".join(terms), "maxResults": cfg["max_results"]}
+        listing = api_get(account, f"{GMAIL_URL}/messages?" + urllib.parse.urlencode(params), self.key)
+        refs = (listing or {}).get("messages", [])
+        if not refs:
             return []
-    return []
+        # The listing only carries ids; fetch the headers of all of them at once.
+        query = urllib.parse.urlencode(
+            [("format", "metadata")] + [("metadataHeaders", h) for h in self.HEADERS])
+
+        def fetch(ref):
+            return api_get(account, f"{GMAIL_URL}/messages/{ref['id']}?{query}", self.key)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(refs))) as pool:
+            messages = [m for m in pool.map(fetch, refs) if m]
+        items, seen = [], set()
+        for message in messages:
+            thread = message.get("threadId") or message["id"]
+            if thread in seen:
+                continue
+            seen.add(thread)
+            headers = {h["name"].lower(): h.get("value", "")
+                       for h in message.get("payload", {}).get("headers", [])}
+            items.append({
+                "id": thread,
+                "subject": headers.get("subject", ""),
+                "from": headers.get("from", ""),
+                "date": int(message.get("internalDate") or 0),
+                "unread": "UNREAD" in message.get("labelIds", []),
+            })
+        return items
+
+    def sort(self, items):
+        return sorted(items, key=lambda m: m["date"], reverse=True)
+
+    def meta(self, item, lang):
+        name, address = email.utils.parseaddr(item.get("from", ""))
+        when = ""
+        if item.get("date"):
+            when = datetime.fromtimestamp(item["date"] / 1000).strftime("%Y-%m-%d")
+        subject = item.get("subject") or LABELS[lang]["no_subject"]
+        return subject, [name or address, when], self.icon
+
+    def url(self, item):
+        return self.fallback_url(item["id"])
+
+    def fallback_url(self, item_id):
+        return f"https://mail.google.com/mail/#all/{item_id}"
+
+    def search_url(self, terms):
+        return "https://mail.google.com/mail/#search/" + urllib.parse.quote(" ".join(terms))
 
 
-def account_url(url, email):
-    """Make the browser open the file with the account that can see it."""
-    if not email:
-        return url
-    parts = urllib.parse.urlsplit(url)
-    query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
-             if k != "authuser"]
-    query.append(("authuser", email))
-    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+class CalendarService(Service):
+    key, object_name, label = "calendar", "Calendar", "Google Calendar"
+    permission = "read access to the events of your calendars"
+    api = "Google Calendar API"
+    home_url = "https://calendar.google.com/"
+    request_scopes = (SCOPE_CALENDAR,)
+    accepted_scopes = (SCOPE_CALENDAR, "https://www.googleapis.com/auth/calendar.readonly",
+                       "https://www.googleapis.com/auth/calendar.events",
+                       "https://www.googleapis.com/auth/calendar")
+    PAST_DAYS = 90
+
+    def _events(self, account, terms, **extra):
+        params = {"q": " ".join(terms), "singleEvents": "true", "orderBy": "startTime", **extra}
+        data = api_get(account, CALENDAR_EVENTS_URL + "?" + urllib.parse.urlencode(params), self.key)
+        return (data or {}).get("items", [])
+
+    def search(self, account, terms, cfg):
+        now = datetime.now(timezone.utc)
+        stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        limit = cfg["max_results"]
+        upcoming = self._events(account, terms, timeMin=stamp, maxResults=limit)
+        for event in upcoming:
+            event["_past"] = False
+        if len(upcoming) >= limit or self.key in account.disabled_services:
+            return upcoming
+        # Fill what is left with the most recent past events.
+        since = (now - timedelta(days=self.PAST_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        past = self._events(account, terms, timeMin=since, timeMax=stamp, maxResults=250)
+        known = {e["id"] for e in upcoming}
+        past = [e for e in past if e["id"] not in known][-(limit - len(upcoming)):]
+        for event in past:
+            event["_past"] = True
+        return upcoming + past
+
+    @staticmethod
+    def _start(event):
+        start = event.get("start") or {}
+        return start.get("dateTime") or start.get("date") or ""
+
+    def sort(self, items):
+        upcoming = sorted((e for e in items if not e.get("_past")), key=self._start)
+        past = sorted((e for e in items if e.get("_past")), key=self._start, reverse=True)
+        return upcoming + past
+
+    def meta(self, item, lang):
+        start = self._start(item)
+        when = start[:10] + (" " + start[11:16] if "T" in start else "")
+        title = item.get("summary") or LABELS[lang]["no_title"]
+        return title, [when.strip(), (item.get("location") or "")[:60]], self.icon
+
+    def url(self, item):
+        return item.get("htmlLink") or self.home_url
+
+    def search_url(self, terms):
+        return ("https://calendar.google.com/calendar/r/search?q="
+                + urllib.parse.quote(" ".join(terms)))
+
+
+class ContactsService(Service):
+    key, object_name, label = "contacts", "Contacts", "Google Contacts"
+    permission = ("read access to your contacts, the people you have exchanged mail with and, "
+                  "on work accounts, your organization's directory")
+    api = "People API"
+    home_url = "https://contacts.google.com/"
+    request_scopes = (SCOPE_CONTACTS, SCOPE_OTHER_CONTACTS, SCOPE_DIRECTORY)
+    accepted_scopes = (SCOPE_CONTACTS, "https://www.googleapis.com/auth/contacts")
+    MASK = "names,emailAddresses,phoneNumbers,organizations"
+
+    def _warm_up(self, account, endpoint, params, key):
+        # The People API asks for an empty query first to build its search index.
+        warmed = account.__dict__.setdefault("_people_warm", set())
+        if endpoint not in warmed:
+            warmed.add(endpoint)
+            api_get(account, f"{PEOPLE_URL}/{endpoint}?"
+                    + urllib.parse.urlencode({**params, "query": ""}), key, disable_on_error=True)
+
+    def _optional(self, account, key, scope, endpoint, params, field, query, warm=False):
+        """A source only some accounts have; whatever the error, stop asking."""
+        granted = account.scopes is None or scope in account.scopes
+        if not granted or key in account.disabled_services:
+            return []
+        if warm:
+            self._warm_up(account, endpoint, params, key)
+        if key in account.disabled_services:
+            return []
+        data = api_get(account, f"{PEOPLE_URL}/{endpoint}?"
+                       + urllib.parse.urlencode({**params, "query": query}), key,
+                       disable_on_error=True)
+        found = (data or {}).get(field, [])
+        return [r.get("person", r) for r in found]
+
+    def search(self, account, terms, cfg):
+        query = " ".join(terms)
+        size = min(cfg["max_results"], 30)
+        base = {"readMask": self.MASK, "pageSize": size}
+        self._warm_up(account, "people:searchContacts", base, self.key)
+        data = api_get(account, f"{PEOPLE_URL}/people:searchContacts?"
+                       + urllib.parse.urlencode({**base, "query": query}), self.key)
+        people = [r.get("person", {}) for r in (data or {}).get("results", [])]
+        # People you have written to but never saved; most work contacts live here.
+        people += self._optional(
+            account, "other_contacts", SCOPE_OTHER_CONTACTS, "otherContacts:search",
+            {"readMask": "names,emailAddresses,phoneNumbers", "pageSize": size}, "results", query,
+            warm=True)
+        # Personal accounts have no directory.
+        people += self._optional(
+            account, "directory", SCOPE_DIRECTORY, "people:searchDirectoryPeople",
+            {**base, "sources": "DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"}, "people", query)
+
+        items, seen = [], set()
+        for person in people:
+            item = self._item(person)
+            key = (item["email"] or item["id"]).lower()
+            if item["id"] and key not in seen:
+                seen.add(key)
+                items.append(item)
+        return items
+
+    @staticmethod
+    def _item(person):
+        def first(field, key):
+            values = person.get(field) or [{}]
+            return values[0].get(key, "")
+
+        org = ", ".join(p for p in (first("organizations", "title"), first("organizations", "name")) if p)
+        return {
+            "id": person.get("resourceName", ""),
+            "name": first("names", "displayName"),
+            "email": first("emailAddresses", "value"),
+            "phone": first("phoneNumbers", "value"),
+            "org": org,
+        }
+
+    def sort(self, items):
+        return sorted(items, key=lambda c: (c["name"] or c["email"]).lower())
+
+    def meta(self, item, lang):
+        name = item["name"] or item["email"] or item["id"]
+        email_part = item["email"] if item["name"] else ""
+        return name, [email_part, item["phone"], item["org"]], self.icon
+
+    def url(self, item):
+        return self.fallback_url(item["id"])
+
+    def fallback_url(self, item_id):
+        return "https://contacts.google.com/person/" + urllib.parse.quote(item_id.split("/")[-1])
+
+    def search_url(self, terms):
+        return "https://contacts.google.com/search/" + urllib.parse.quote(" ".join(terms))
+
+
+SERVICES = [DriveService(), GmailService(), CalendarService(), ContactsService()]
+SERVICES_BY_KEY = {service.key: service for service in SERVICES}
+
+
+def enabled_services(cfg):
+    return [s for s in SERVICES if cfg["services"].get(s.key)]
+
+
+def login_scopes(cfg):
+    """Everything the enabled services need, plus the address of the account."""
+    scopes = [SCOPE_EMAIL]
+    for service in enabled_services(cfg):
+        scopes += [s for s in service.scopes(cfg) if s not in scopes]
+    return scopes
 
 
 # ---------------------------------------------------------------------------
@@ -797,35 +1198,32 @@ def open_url(url, email=None, cfg=None):
 
 
 # ---------------------------------------------------------------------------
-# D-Bus search provider
+# D-Bus search providers
 # ---------------------------------------------------------------------------
 
 
-class SearchProvider:
-    def __init__(self, loop, cfg):
-        self.loop = loop
+class AccountManager:
+    """Accounts from every source, shared by the providers of all services."""
+
+    def __init__(self, cfg):
         self.cfg = cfg
-        self.lang = ui_language()
         self.token_file = TokenFile(cfg["token_file"])
-        self.files = {}
-        self.seq = 0
-        self.pending = None
         self.last_activity = time.monotonic()
         self._accounts = None
         self._accounts_at = 0.0
         self._known = {}
-        GLib.timeout_add_seconds(30, self._maybe_exit)
 
-    # -- accounts -----------------------------------------------------------
+    def touch(self):
+        self.last_activity = time.monotonic()
 
-    def invalidate_accounts(self):
-        """Force the next accounts() call to re-read every source."""
+    def invalidate(self):
+        """Force the next all() call to re-read every source."""
         # Not a timestamp trick: time.monotonic() counts from boot and can be
         # smaller than the refresh interval on a machine that just started.
         self._accounts = None
 
-    def accounts(self):
-        """Usable accounts. Re-read every minute so --login shows up without a restart."""
+    def all(self):
+        """Every account. Re-read each minute so new logins show up without a restart."""
         if self._accounts is None or time.monotonic() - self._accounts_at > 60:
             found = stored_accounts()
             fallback = self.token_file.account()
@@ -834,34 +1232,50 @@ class SearchProvider:
             logged_in = {a.identity.lower() for a in found}
             found += [a for a in goa_accounts() if a.identity.lower() not in logged_in]
             # Keep the objects we already know: they hold cached tokens and the
-            # "disabled" flag of accounts that cannot access Drive.
+            # services Google refused for them.
             known = {}
             for account in found:
                 key = (account.source, account.identity)
-                known[key] = self._known.get(key, account)
+                old = self._known.get(key)
+                if old is not None:
+                    old.scopes = account.scopes  # a new login may have granted more
+                known[key] = old or account
             self._known = known
             self._accounts = list(known.values())
             self._accounts_at = time.monotonic()
             if not self._accounts:
-                log("no Google account: run 'gnome-drive-search-provider --login'", always=True)
-        return [a for a in self._accounts if not a.disabled]
+                log("no Google account: run 'gnome-google-workspace-search --setup'", always=True)
+        return self._accounts
 
-    # -- lifecycle ----------------------------------------------------------
 
-    def _touch(self):
-        self.last_activity = time.monotonic()
+class SearchProvider:
+    """org.gnome.Shell.SearchProvider2 for one service."""
 
-    def _maybe_exit(self):
-        if time.monotonic() - self.last_activity > self.cfg["idle_exit_seconds"]:
-            log("idle, exiting")
-            self.loop.quit()
-            return False
-        return True
+    def __init__(self, loop, cfg, service=None, manager=None):
+        self.loop = loop
+        self.cfg = cfg
+        self.service = service or SERVICES_BY_KEY["drive"]
+        self.manager = manager or AccountManager(cfg)
+        self.lang = ui_language()
+        self.files = {}
+        self.seq = 0
+        self.pending = None
+
+    # -- accounts -----------------------------------------------------------
+
+    def invalidate_accounts(self):
+        self.manager.invalidate()
+
+    def accounts(self):
+        """Accounts this service can search right now."""
+        if not self.cfg["services"].get(self.service.key):
+            return []
+        return [a for a in self.manager.all() if self.service.usable(a, self.cfg)]
 
     # -- D-Bus dispatch -----------------------------------------------------
 
     def handle_call(self, conn, sender, path, iface, method, params, invocation):
-        self._touch()
+        self.manager.touch()
         handler = getattr(self, method, None)
         if handler is None:
             invocation.return_dbus_error(
@@ -871,7 +1285,7 @@ class SearchProvider:
         try:
             handler(params, invocation)
         except Exception as e:  # noqa: BLE001
-            log(f"{method} failed: {e!r}", always=True)
+            log(f"{self.service.key}.{method} failed: {e!r}", always=True)
             invocation.return_dbus_error(f"{APP_ID}.Error", str(e))
 
     def _return_ids(self, invocation, ids):
@@ -879,7 +1293,7 @@ class SearchProvider:
 
     def _search_async(self, terms, invocation):
         query = [t.strip() for t in terms if t.strip()]
-        if sum(len(t) for t in query) < self.cfg["min_chars"]:
+        if sum(len(t) for t in query) < self.cfg["min_chars"] or not self.accounts():
             self._return_ids(invocation, [])
             return
         self.seq += 1
@@ -900,13 +1314,15 @@ class SearchProvider:
         def finish(results):
             if seq != self.seq:
                 return False
-            results.sort(key=lambda f: f.get("modifiedTime", ""), reverse=True)
             ids = []
-            for f in results[: self.cfg["max_results"]]:
-                if f["id"] in ids:
+            for item in self.service.sort(results):
+                item_id = self.service.item_id(item)
+                if item_id in ids:
                     continue
-                self.files[f["id"]] = f
-                ids.append(f["id"])
+                if len(ids) >= self.cfg["max_results"]:
+                    break
+                self.files[item_id] = item
+                ids.append(item_id)
             self.pending = None
             self._return_ids(invocation, ids)
             return False
@@ -921,18 +1337,18 @@ class SearchProvider:
 
         def one(account):
             try:
-                files = drive_search(account, terms, self.cfg)
+                items = self.service.search(account, terms, self.cfg)
             except Exception as e:  # noqa: BLE001
-                log(f"[{account.identity}] search failed: {e!r}", always=True)
+                log(f"[{account.identity}] {self.service.key} search failed: {e!r}", always=True)
                 return []
-            email = account.resolve_email() if files else account.email
-            for f in files:
-                f["_account"] = email or account.identity
-                f["_email"] = email
-            return files
+            address = account.resolve_email() if items else account.email
+            for item in items:
+                item["_account"] = address or account.identity
+                item["_email"] = address
+            return items
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(accounts)) as pool:
-            return [f for files in pool.map(one, accounts) for f in files]
+            return [item for items in pool.map(one, accounts) for item in items]
 
     # -- SearchProvider2 methods --------------------------------------------
 
@@ -950,31 +1366,28 @@ class SearchProvider:
         metas = [self.result_meta(self.files[i], multi) for i in ids if i in self.files]
         invocation.return_value(GLib.Variant("(aa{sv})", (metas,)))
 
-    def result_meta(self, f, multi_account=False):
-        mime = f.get("mimeType", "")
-        owner = ", ".join(o.get("displayName", "") for o in f.get("owners", []) if o)
-        when = (f.get("modifiedTime") or "")[:10]
-        parts = [kind_label(mime, self.lang), owner, when]
+    def result_meta(self, item, multi_account=False):
+        name, parts, icon = self.service.meta(item, self.lang)
         if multi_account:
-            parts.append(f.get("_account", ""))
+            parts = list(parts) + [item.get("_account", "")]
         return {
-            "id": GLib.Variant("s", f["id"]),
-            "name": GLib.Variant("s", f.get("name", f["id"])),
+            "id": GLib.Variant("s", self.service.item_id(item)),
+            "name": GLib.Variant("s", name),
             "description": GLib.Variant("s", " - ".join(p for p in parts if p)),
-            "gicon": GLib.Variant("s", ICONS.get(mime, "text-x-generic")),
+            "gicon": GLib.Variant("s", icon),
         }
 
     def ActivateResult(self, params, invocation):
-        (fid, _terms, _ts) = params.unpack()
-        f = self.files.get(fid, {})
-        url = f.get("webViewLink") or f"https://drive.google.com/open?id={fid}"
-        self._open(account_url(url, f.get("_email")), f.get("_email"))
+        (item_id, _terms, _ts) = params.unpack()
+        item = self.files.get(item_id)
+        url = self.service.url(item) if item else self.service.fallback_url(item_id)
+        address = (item or {}).get("_email")
+        self._open(account_url(url, address), address)
         invocation.return_value(None)
 
     def LaunchSearch(self, params, invocation):
         (terms, _ts) = params.unpack()
-        q = urllib.parse.quote(" ".join(terms))
-        self._open(f"https://drive.google.com/drive/search?q={q}")
+        self._open(self.service.search_url(terms))
         invocation.return_value(None)
 
     def _open(self, url, email=None):
@@ -987,14 +1400,14 @@ class SearchProvider:
 
 CLIENT_GUIDE = """\
   You need an OAuth client of your own (free, about five minutes, only once):
-    1. https://console.cloud.google.com/ : create a project, then enable the
-       "Google Drive API" under APIs & Services > Library.
+    1. https://console.cloud.google.com/ : create a project, then under
+       APIs & Services > Library enable: {apis}.
     2. APIs & Services > OAuth consent screen: choose External (or Internal for a
        Google Workspace organization), fill in the name, then press "Publish app".
        Left in "Testing", Google expires your login every 7 days.
     3. APIs & Services > Credentials > Create credentials > OAuth client ID,
        type "Desktop app", and download the JSON file.
-  Full guide: https://github.com/jarrieta86/gnome-drive-search-provider#creating-the-oauth-client
+  Full guide: https://github.com/jarrieta86/gnome-google-workspace-search#creating-the-oauth-client
 """
 
 
@@ -1014,10 +1427,12 @@ def ask_yes_no(prompt, default=True):
     return answer in ("y", "yes", "s", "si", "sí")
 
 
-def provider_registration():
-    """Path of the .ini GNOME Shell will load, or None when it cannot see the provider."""
+def provider_registration(service=None):
+    """Path of the .ini GNOME Shell will load for a service, or None if it cannot see it."""
+    service = service or SERVICES_BY_KEY["drive"]
+    name = f"{APP_ID}.{service.object_name}.ini"
     for data_dir in GLib.get_system_data_dirs():
-        path = os.path.join(data_dir, "gnome-shell", "search-providers", APP_ID + ".ini")
+        path = os.path.join(data_dir, "gnome-shell", "search-providers", name)
         if os.path.exists(path):
             return path
     return None
@@ -1034,17 +1449,19 @@ def find_client_secret_candidates(home=None):
     return sorted(paths, key=os.path.getmtime, reverse=True)
 
 
-def setup_client(store=None):
+def setup_client(store=None, cfg=None):
     """Make sure a valid OAuth client is stored; returns False if the user gives up."""
     store = store or CLIENT_SECRET_PATH
+    apis = ", ".join(s.api for s in enabled_services(cfg or DEFAULTS)) or DriveService.api
     if os.path.exists(store):
         try:
             load_client_secret(store)
             print(f"  OAuth client: ready ({store})")
+            print(f"  Its Google Cloud project must have these APIs enabled: {apis}.")
             return True
         except LoginError as e:
             print(f"  The stored OAuth client is unusable: {e}")
-    print(CLIENT_GUIDE)
+    print(CLIENT_GUIDE.format(apis=apis))
     candidates = find_client_secret_candidates()
     while True:
         path = ask("  Path to the downloaded client JSON (empty to stop)",
@@ -1060,34 +1477,51 @@ def setup_client(store=None):
             continue
         if client["kind"] == "web":
             print("  Note: that is a 'Web application' client; a 'Desktop app' one is simpler.")
-        os.makedirs(os.path.dirname(store), exist_ok=True)
+        os.makedirs(os.path.dirname(store), mode=0o700, exist_ok=True)
         shutil.copyfile(path, store)
         os.chmod(store, 0o600)
         print(f"  OAuth client saved to {store}")
         return True
 
 
-def save_search_mode(mode, path=None):
+def save_preferences(cfg, path=None):
+    """Write the choices made in --setup, leaving every other key of the file alone."""
     path = path or CONFIG_PATH
     parser = configparser.ConfigParser()
     parser.read(path)
-    if not parser.has_section("search"):
-        parser.add_section("search")
-    if parser["search"].get("mode", DEFAULTS["mode"]) == mode:
-        return
-    parser["search"]["mode"] = mode
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for section in ("search", "services"):
+        if not parser.has_section(section):
+            parser.add_section(section)
+    parser["search"]["mode"] = cfg["mode"]
+    for key, enabled in cfg["services"].items():
+        parser["services"][key] = "true" if enabled else "false"
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     with open(path, "w") as f:
         parser.write(f)
 
 
+def account_scopes(email, accounts_dir=None):
+    try:
+        with open(account_path(email, accounts_dir)) as f:
+            return json.load(f).get("scopes") or []
+    except (OSError, ValueError):
+        return []
+
+
+def missing_services(account, cfg):
+    """Enabled services this account has not granted (only knowable for token files)."""
+    if account.scopes is None:
+        return []
+    return [s for s in enabled_services(cfg) if not account.scopes & s.accepted(cfg)]
+
+
 def describe_account(account, cfg):
     text = f"{account.identity}"
-    email = account.email
-    if email and cfg.get("use_profiles", True):
+    address = account.email
+    if address and cfg.get("use_profiles", True):
         try:
             app = Gio.AppInfo.get_default_for_uri_scheme("https")
-            argv = app and profile_command(app.get_id(), app.get_commandline(), "", email,
+            argv = app and profile_command(app.get_id(), app.get_commandline(), "", address,
                                            cfg.get("profiles"))
         except GLib.Error:
             argv = None
@@ -1100,11 +1534,11 @@ def describe_account(account, cfg):
 
 
 def run_setup(cfg, config_path=None):
-    """Interactive, re-runnable configuration: provider check, OAuth client, accounts, test."""
+    """Interactive, re-runnable configuration: services, OAuth client, accounts, test."""
     if not sys.stdin.isatty():
         print("Error: --setup is interactive; run it in a terminal.", file=sys.stderr)
         return 1
-    print("Google Drive search for GNOME: setup\n")
+    print("Google Workspace search for GNOME: setup\n")
     try:
         return _setup_steps(cfg, config_path or CONFIG_PATH)
     except KeyboardInterrupt:
@@ -1114,77 +1548,81 @@ def run_setup(cfg, config_path=None):
 
 def _setup_steps(cfg, config_path):
     print("1. GNOME Shell integration")
-    registration = provider_registration()
-    if registration:
-        print(f"  Registered: {registration}")
+    registered = {s.key: provider_registration(s) for s in SERVICES}
+    if all(registered.values()):
+        print(f"  Registered in {os.path.dirname(registered['drive'])}")
     else:
-        print("  Not registered: GNOME Shell cannot see the provider yet.\n"
+        missing = ", ".join(s.label for s in SERVICES if not registered[s.key])
+        print(f"  Not registered: GNOME Shell cannot see {missing} yet.\n"
               "  Run ./install.sh from the project directory and follow its last step.")
 
-    print("\n2. What to search")
-    fulltext = ask_yes_no("  Also search inside file contents? Slower, and needs read access "
-                          "to your files instead of names only", cfg["mode"] == "fulltext")
-    cfg["mode"] = "fulltext" if fulltext else "name"
-    save_search_mode(cfg["mode"], config_path)
+    print("\n2. Services (each one is its own section in the overview)")
+    for service in SERVICES:
+        print(f"  {service.label}: needs {service.permission}.")
+        cfg["services"][service.key] = ask_yes_no(
+            f"    Search {service.label}?", cfg["services"].get(service.key, False))
+        if service.key == "drive" and cfg["services"]["drive"]:
+            fulltext = ask_yes_no("    Also search inside file contents? Slower, and needs read "
+                                  "access to your files instead of names only",
+                                  cfg["mode"] == "fulltext")
+            cfg["mode"] = "fulltext" if fulltext else "name"
+    if not enabled_services(cfg):
+        print("  Nothing enabled, so there is nothing to search. Run --setup again to change it.")
+        save_preferences(cfg, config_path)
+        return 1
+    save_preferences(cfg, config_path)
 
     print("\n3. OAuth client")
-    have_client = setup_client()
+    have_client = setup_client(cfg=cfg)
 
     print("\n4. Google accounts")
-    provider = SearchProvider(GLib.MainLoop(), cfg)
-    provider.accounts()
-    wanted = SCOPE_READONLY if fulltext else SCOPE_METADATA
-    for account in provider._accounts:
+    manager = AccountManager(cfg)
+    scopes = login_scopes(cfg)
+
+    def connect(hint=None):
+        try:
+            address = login(scopes=scopes, login_hint=hint)
+        except LoginError as e:
+            print(f"  Login failed: {e}")
+            return
+        manager.invalidate()
+        added = next((a for a in manager.all() if a.identity == address), None)
+        if added:
+            print(f"  + {describe_account(added, cfg)}")
+
+    for account in manager.all():
         print(f"  - {describe_account(account, cfg)}")
-    if not provider._accounts:
+        lacking = missing_services(account, cfg)
+        if lacking and have_client and account.source == "login":
+            names = ", ".join(s.label for s in lacking)
+            if ask_yes_no(f"    It has not authorized {names}. Authorize now?", True):
+                connect(account.identity)
+        elif lacking:
+            print(f"    Cannot search {', '.join(s.label for s in lacking)}: its token does not "
+                  "cover them.")
+    if not manager.all():
         print("  None yet.")
     add = have_client and ask_yes_no(
-        "  Add an account?" if not provider._accounts else "  Add another account?",
-        default=not provider._accounts)
+        "  Add an account?" if not manager.all() else "  Add another account?",
+        default=not manager.all())
     while add:
         print("  Tip: with one browser profile per account, copy the link below into the "
               "right profile.")
-        try:
-            email = login(fulltext=fulltext)
-            provider.invalidate_accounts()
-            added = next((a for a in provider.accounts() if a.identity == email), None)
-            if added:
-                print(f"  + {describe_account(added, cfg)}")
-        except LoginError as e:
-            print(f"  Login failed: {e}")
+        connect()
         add = ask_yes_no("  Add another account?", default=False)
-    if fulltext:
-        stale = [a.identity for a in provider._accounts
-                 if a.source == "login" and wanted not in account_scopes(a.identity)]
-        if stale:
-            print("  These accounts were connected for names only; log in to them again to "
-                  f"search contents: {', '.join(stale)}")
 
     print("\n5. Test")
-    provider.invalidate_accounts()
-    if not provider.accounts():
+    manager.invalidate()
+    providers = [SearchProvider(None, cfg, s, manager) for s in enabled_services(cfg)]
+    if not any(p.accounts() for p in providers):
         print("  No usable account, nothing to test. Run --setup again when you have one.")
         return 1
-    term = ask("  Type part of a file name to try a search (empty to skip)")
+    term = ask("  Type a word to try a search (empty to skip)")
     if term:
-        files = provider.search_all(term.split())
-        files.sort(key=lambda f: f.get("modifiedTime", ""), reverse=True)
-        multi = len(provider.accounts()) > 1
-        for f in files[:5]:
-            meta = provider.result_meta(f, multi)
-            print(f"    {meta['name'].get_string()}  ({meta['description'].get_string()})")
-        print(f"  {len(files)} result(s)." if files else "  No results for that term.")
+        print_results(providers, term.split(), limit=3, indent="    ")
     print("\nDone. Open the Activities overview and type to search."
-          + ("" if registration else " (After registering the provider, see step 1.)"))
+          + ("" if all(registered.values()) else " (After registering the providers, see step 1.)"))
     return 0
-
-
-def account_scopes(email, accounts_dir=None):
-    try:
-        with open(account_path(email, accounts_dir)) as f:
-            return json.load(f).get("scopes") or []
-    except (OSError, ValueError):
-        return []
 
 
 # ---------------------------------------------------------------------------
@@ -1192,69 +1630,103 @@ def account_scopes(email, accounts_dir=None):
 # ---------------------------------------------------------------------------
 
 
+def print_results(providers, terms, limit=None, indent="", urls=False):
+    total = 0
+    for provider in providers:
+        accounts = provider.accounts()
+        items = provider.service.sort(provider.search_all(terms)) if accounts else []
+        total += len(items)
+        print(f"{indent}{provider.service.label}: {len(items)} result(s)"
+              + ("" if accounts else " (no account can search it)"))
+        for item in items[:limit]:
+            meta = provider.result_meta(item, len(accounts) > 1)
+            print(f"{indent}  {meta['name'].get_string()}  ({meta['description'].get_string()})")
+            if urls:
+                print(f"{indent}    {account_url(provider.service.url(item), item.get('_email'))}")
+    return total
+
+
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="GNOME Shell search provider for Google Drive")
+    parser = argparse.ArgumentParser(
+        description="GNOME Shell search providers for Google Drive, Gmail, Calendar and Contacts")
     parser.add_argument("-v", "--verbose", action="store_true", help="log to stderr")
     parser.add_argument("--config", default=CONFIG_PATH, help="path to config.ini")
+    parser.add_argument("--setup", action="store_true",
+                        help="guided setup: services, OAuth client, accounts and a test search")
     parser.add_argument(
         "--query", nargs="+", metavar="TERM",
         help="run one search from the command line and print the results (for debugging)",
     )
-    parser.add_argument("--setup", action="store_true",
-                        help="guided setup: OAuth client, accounts and a test search")
+    parser.add_argument("--service", choices=sorted(SERVICES_BY_KEY),
+                        help="with --query: search only this service (default: all enabled)")
     auth = parser.add_argument_group("accounts")
     auth.add_argument("--login", action="store_true",
-                      help="add a Google account (run it once per account)")
+                      help="add a Google account, or authorize an existing one again")
     auth.add_argument("--client-secret", metavar="FILE",
                       help="OAuth client JSON from Google Cloud; only needed on the first --login")
     auth.add_argument("--fulltext", action="store_true",
-                      help="with --login: also request read access, needed for mode = fulltext")
+                      help="with --login: request read access to Drive contents (mode = fulltext)")
     auth.add_argument("--port", type=int, default=0,
                       help="with --login: fixed loopback port (only for 'Web application' clients)")
     auth.add_argument("--no-browser", action="store_true",
                       help="with --login: only print the link, do not open a browser")
-    auth.add_argument("--accounts", action="store_true", help="list the accounts being searched")
+    auth.add_argument("--accounts", action="store_true",
+                      help="list the accounts and what each one can search")
     auth.add_argument("--logout", metavar="EMAIL", help="remove an account and revoke its token")
     return parser.parse_args(argv)
 
 
-def run_query(cfg, terms):
-    provider = SearchProvider(GLib.MainLoop(), cfg)
-    accounts = provider.accounts()
-    if not accounts:
+def run_query(cfg, terms, service_key=None):
+    manager = AccountManager(cfg)
+    if service_key:
+        cfg["services"][service_key] = True
+        services = [SERVICES_BY_KEY[service_key]]
+    else:
+        services = enabled_services(cfg)
+    providers = [SearchProvider(None, cfg, s, manager) for s in services]
+    if not manager.all():
         return 1
-    files = provider.search_all(terms)
-    files.sort(key=lambda f: f.get("modifiedTime", ""), reverse=True)
-    for f in files:
-        meta = provider.result_meta(f, len(accounts) > 1)
-        url = account_url(f.get("webViewLink", ""), f.get("_email"))
-        print(f"{meta['name'].get_string()}\n    {meta['description'].get_string()}\n    {url}")
+    print_results(providers, terms, urls=True)
     return 0
 
 
 def run_accounts(cfg):
-    provider = SearchProvider(GLib.MainLoop(), cfg)
-    provider.accounts()
+    manager = AccountManager(cfg)
     labels = {"login": "--login", "token_file": "auth.token_file", "goa": "GNOME Online Accounts"}
-    if not provider._accounts:
-        print("No accounts. Add one with: gnome-drive-search-provider --login")
+    if not manager.all():
+        print("No accounts. Add one with: gnome-google-workspace-search --setup")
         return 1
-    for account in provider._accounts:
-        print(f"{account.identity}  ({labels.get(account.source, account.source)})")
+    for account in manager.all():
+        can = [s.label for s in enabled_services(cfg) if s.usable(account, cfg)]
+        print(f"{account.identity}  ({labels.get(account.source, account.source)})  "
+              f"searches: {', '.join(can) or 'nothing enabled'}")
+        lacking = missing_services(account, cfg)
+        if lacking:
+            print(f"    not authorized for: {', '.join(s.label for s in lacking)} (run --setup)")
     return 0
+
+
+def migrate_legacy_config():
+    """The project used to be gnome-drive-search-provider; bring its config along."""
+    if os.path.isdir(LEGACY_CONFIG_DIR) and not os.path.exists(CONFIG_DIR):
+        shutil.move(LEGACY_CONFIG_DIR, CONFIG_DIR)
+        log(f"moved {LEGACY_CONFIG_DIR} to {CONFIG_DIR}", always=True)
 
 
 def main(argv=None):
     global VERBOSE
     args = parse_args(sys.argv[1:] if argv is None else argv)
     VERBOSE = args.verbose
+    migrate_legacy_config()
     cfg = load_config(args.config)
     if args.setup:
         return run_setup(cfg, args.config)
     try:
         if args.login:
-            login(args.client_secret, fulltext=args.fulltext or cfg["mode"] == "fulltext",
-                  port=args.port, open_browser=not args.no_browser)
+            if args.fulltext:
+                cfg["mode"] = "fulltext"
+            login(args.client_secret, port=args.port, open_browser=not args.no_browser,
+                  scopes=login_scopes(cfg))
             return 0
         if args.logout:
             logout(args.logout)
@@ -1265,19 +1737,30 @@ def main(argv=None):
     if args.accounts:
         return run_accounts(cfg)
     if args.query:
-        return run_query(cfg, args.query)
+        return run_query(cfg, args.query, args.service)
 
     loop = GLib.MainLoop()
-    provider = SearchProvider(loop, cfg)
+    manager = AccountManager(cfg)
+    providers = [SearchProvider(loop, cfg, service, manager) for service in SERVICES]
     node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION_XML)
 
     def on_bus_acquired(conn, name):
-        conn.register_object(OBJECT_PATH, node.interfaces[0], provider.handle_call, None, None)
+        for provider in providers:
+            path = f"{OBJECT_PATH}/{provider.service.object_name}"
+            conn.register_object(path, node.interfaces[0], provider.handle_call, None, None)
 
     def on_name_lost(conn, name):
         log("bus name lost, exiting", always=True)
         loop.quit()
 
+    def maybe_exit():
+        if time.monotonic() - manager.last_activity > cfg["idle_exit_seconds"]:
+            log("idle, exiting")
+            loop.quit()
+            return False
+        return True
+
+    GLib.timeout_add_seconds(30, maybe_exit)
     Gio.bus_own_name(
         Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
         on_bus_acquired, None, on_name_lost,
