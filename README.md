@@ -82,10 +82,22 @@ A short conversation in the terminal, safe to run again whenever you want to
 change something. It never removes anything.
 
 1. **GNOME Shell integration**: confirms the Shell can see the providers.
-2. **Services**: choose what to search. Each service states the permission it
-   needs before you say yes.
-3. **OAuth client**: stores your client, offering the newest
-   `client_secret*.json` in `~/Downloads`, or prints how to create one.
+2. **Services**: a checklist of what to search, each entry with the permission
+   it needs. Arrows (or `j`/`k`) move, space or `x` marks, `a` marks all, Enter
+   confirms:
+
+   ```
+     > [x] Google Drive     file names, owners and dates
+       [ ] Gmail            reads ALL your mail
+       [x] Google Calendar  reads your events
+       [ ] Google Contacts  reads contacts, people you wrote to, work directory
+   ```
+
+   Terminals that cannot be driven key by key get one yes/no question per
+   service instead.
+3. **OAuth client**: if you have none, walks you through registering one,
+   opening each Google Cloud page for you
+   (see [Creating the OAuth client](#creating-the-oauth-client)).
 4. **Google accounts**: lists the connected accounts with the browser profile
    each opens in, asks already connected accounts to authorize any service you
    just enabled, and adds as many accounts as you want (one browser login each).
@@ -145,30 +157,46 @@ gnome-google-workspace-search --logout me@x.com   # revoke and remove one
 
 ### Creating the OAuth client
 
-Google classifies Drive and Gmail permissions as *restricted*, which means a
-project like this cannot ship a shared, verified OAuth client without a paid
-yearly security audit. So you create your own, once:
+Google only lets a program ask for access on behalf of an *OAuth client*
+registered in a Google Cloud project. Programs that seem to need none (rclone,
+Thunderbird, GNOME itself) simply ship theirs. This project cannot do that in
+good conscience yet: Google classifies Drive and Gmail permissions as
+*restricted*, and a shared client for them needs a paid yearly security audit,
+or else is capped at 100 users. So you register your own, once. It is free,
+takes about five minutes, and the client grants nothing by itself: it only
+identifies the app. Access is granted later, per account, in your browser.
 
-1. Open the [Google Cloud console](https://console.cloud.google.com/), create a
-   project (any name) and, under *APIs & Services > Library*, enable the API of
-   each service you want: **Google Drive API**, **Gmail API**, **Google Calendar
-   API**, **People API** (contacts).
-2. Under *APIs & Services > OAuth consent screen*, choose **External** (or
-   **Internal** if this is a Google Workspace project and you only need accounts
-   of that organization). Fill in the app name and your email.
-3. Still on the consent screen, either add each of your accounts as a **test
-   user**, or press **Publish app**. Prefer publishing: while an External app is
-   in *Testing*, Google expires its refresh tokens after 7 days and you would
-   have to log in again every week. A published, unverified app works for up to
-   100 users; you will see a "Google hasn't verified this app" warning during
-   login, which is expected for your own client (*Advanced > Go to ...*).
-4. Under *APIs & Services > Credentials*, create an **OAuth client ID** of type
-   **Desktop app** and download its JSON. That file is what the setup asks for.
+`--setup` walks you through it. It asks which Google account will own the
+client (use a personal one: it can then accept any account), opens each of the
+three pages in that account's browser profile, and picks up the file you
+download at the end. It only ever offers a file downloaded during that walk,
+never older ones lying in `~/Downloads`. The pages are:
 
-Work accounts: a Google Workspace administrator can block third-party apps. If
-login fails with "access blocked by your organization", ask the admin to trust
-your client ID, or create the client inside the organization's own Google Cloud
-as an *Internal* app.
+1. **Project and APIs**: one link creates a project and enables the API of every
+   service you chose (Google Drive API, Gmail API, Google Calendar API, People
+   API). First-time Google Cloud users accept its terms there; no billing needed.
+2. **Consent screen** (*Google Auth Platform > Get started*): any app name, it is
+   what the login page will show. Audience **External**. Then, under *Audience*,
+   press **Publish app**. Left in *Testing*, Google expires logins after 7 days
+   and only accepts accounts listed as test users. A published, unverified app
+   works for up to 100 users and shows a "Google hasn't verified this app"
+   warning at login, which is expected for your own client
+   (*Advanced > Go to ...*).
+3. **OAuth client** (*Clients > Create*): application type **Desktop app**, then
+   *Download JSON*.
+
+Audience **Internal** is only offered inside a Google Workspace organization and
+only accepts that organization's accounts. Work accounts: an administrator can
+block third-party apps. If login fails with "access blocked by your
+organization", ask the admin to trust your client ID, or create an Internal
+client inside the organization's own Google Cloud.
+
+**Shipping a client with a fork or package.** Put the client JSON at
+`conf/oauth_client.json` before running `install.sh` and it is installed next to
+the program and used whenever the user has not stored a client of their own, so
+`--setup` goes straight to the browser login. Google does not treat the secret
+of a desktop client as confidential, but mind the 100-user cap of unverified
+apps and that every user shares your project's API quota.
 
 ### More than one OAuth client
 
@@ -180,9 +208,8 @@ saying *"this client is restricted to users within its organization"*
 personal Gmail account.
 
 When that happens, press Ctrl+C in the setup. It explains the likely cause and
-asks for another client to use for that account, offering any
-`client_secret*.json` it finds in `~/Downloads`. Create that second client as
-**External** in a personal Google Cloud project, following the steps above.
+offers to register another client for that account with the same guided walk,
+this time **External** and owned by a personal account.
 
 Each account remembers the client it was connected with, refreshes its token
 with it, and is authorized again with it when you enable more services. Extra

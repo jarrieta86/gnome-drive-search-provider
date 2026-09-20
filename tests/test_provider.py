@@ -798,7 +798,8 @@ def test_activate_result_passes_the_account_to_the_opener(monkeypatch):
 # Guided setup
 # ---------------------------------------------------------------------------
 
-# Answers to step 2 of --setup: Drive?, contents?, Gmail?, Calendar?, Contacts?
+# Answers to step 2 of --setup without a key-driven terminal:
+# Drive?, Gmail?, Calendar?, Contacts?, then Drive contents?
 DRIVE_ONLY = ["", "", "", "", ""]
 
 
@@ -814,15 +815,20 @@ def setup_env(tmp_path, monkeypatch, answers, registered=True):
     monkeypatch.setattr(provider, "goa_accounts", lambda: [])
     monkeypatch.setattr(provider, "provider_registration",
                         lambda service=None: "/usr/share/p/x.ini" if registered else None)
-    prompts, queue = [], list(answers)
+    prompts, queue = PromptLog(), list(answers)
 
     def fake_input(prompt):
         prompts.append(prompt)
         if not queue:
             raise AssertionError(f"unexpected prompt: {prompt}")
-        return queue.pop(0)
+        answer = queue.pop(0)
+        return answer() if callable(answer) else answer
 
     monkeypatch.setattr("builtins.input", fake_input)
+    opened = []
+    monkeypatch.setattr(provider, "open_url", lambda url, email=None, cfg=None: opened.append((url, email)))
+    monkeypatch.setattr(provider, "bundled_client_path", lambda: None)
+    prompts.opened = opened
     logins = []
     emails = iter(["me@gmail.com", "me@work.com"])
 
@@ -839,6 +845,12 @@ def setup_env(tmp_path, monkeypatch, answers, registered=True):
         {"id": account.identity, "name": f"Budget of {account.identity}", "mimeType": "application/pdf",
          "modifiedTime": "2026-01-01T00:00:00Z"}])
     return cfg_dir, prompts, queue, logins
+
+
+class PromptLog(list):
+    """Prompts shown, plus the pages the setup opened in the browser."""
+
+    opened = ()
 
 
 def run_setup_with_config():
@@ -858,27 +870,70 @@ def connect(cfg_dir, email, *scopes):
 def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path, monkeypatch, capsys):
     downloads = tmp_path / "Downloads"
     downloads.mkdir()
-    secret = write_client_secret(downloads)
+    stale = write_named_client(downloads, "client_secret_old.json", "999")
+    os.utime(stale, (1, 1))  # an old download from some other project: never offered
+
+    def download():
+        write_named_client(downloads, "client_secret_new.json", "555")
+        return ""
+
     answers = DRIVE_ONLY + [
-        "",          # client path: accept the one found in ~/Downloads
-        "",          # add an account? default yes
-        "y",         # add another?
-        "",          # add another? default no
-        "budget",    # test search
+        "me@gmail.com",  # account that will own the OAuth client
+        "", "",          # steps 1 and 2 done
+        download,        # step 3 done: the browser saved the JSON
+        "",              # path: accept the fresh download
+        "",              # add an account? default yes
+        "y",             # add another?
+        "",              # add another? default no
+        "budget",        # test search
     ]
     cfg_dir, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
 
     assert run_setup_with_config() == 0
     assert queue == []
-    assert str(secret) in prompts[5]  # the downloaded client was offered as default
+    assert "client_secret_new.json" in prompts[9] and "old" not in prompts[9]
+    pages = [url for url, _ in prompts.opened]
+    assert "flows/enableapi?apiid=drive.googleapis.com" in pages[0]
+    assert "/auth/overview" in pages[1] and "/auth/clients/create" in pages[2]
+    assert all("authuser=me%40gmail.com" in url and who == "me@gmail.com" for url, who in prompts.opened)
     drive_only = [provider.SCOPE_EMAIL, provider.SCOPE_METADATA]
     assert logins == [("me@gmail.com", drive_only), ("me@work.com", drive_only)]
-    assert oct((cfg_dir / "client_secret.json").stat().st_mode & 0o777) == "0o600"
+    stored = cfg_dir / "client_secret.json"
+    assert oct(stored.stat().st_mode & 0o777) == "0o600"
+    assert provider.load_client_secret(str(stored))["project"] == "proj-555"
     out = capsys.readouterr().out
     assert "Registered in /usr/share/p" in out
+    assert "Audience: External" in out and "Publish app" in out and "Desktop app" in out
     assert "Google Drive: 2 result(s)" in out
-    assert "Budget of me@gmail.com" in out and "Budget of me@work.com" in out
     assert "Gmail:" not in out.split("5. Test")[1]  # disabled services are not searched
+
+
+def test_client_creation_enables_the_apis_of_the_chosen_services():
+    cfg = all_on()
+    url = provider.creation_steps(cfg)[0][1]
+    assert url.endswith("apiid=drive.googleapis.com,gmail.googleapis.com,"
+                        "calendar-json.googleapis.com,people.googleapis.com")
+
+
+def test_client_creation_rejects_web_clients_and_can_be_skipped(tmp_path, monkeypatch, capsys):
+    web = write_client_secret(tmp_path, "web")
+    _, prompts, queue, _ = setup_env(tmp_path, monkeypatch, ["", "", "", "", str(web), ""])
+    #                        no owner: pages are printed, not opened / 3 steps / web client / stop
+    assert provider.guide_client_creation(dict(provider.DEFAULTS)) is None
+    assert queue == [] and list(prompts.opened) == []
+    assert "needs a 'Desktop app' one" in capsys.readouterr().out
+
+
+def test_a_bundled_client_makes_setup_skip_client_creation(tmp_path, monkeypatch, capsys):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    shipped = write_named_client(tmp_path / "share", "oauth_client.json", "777")
+    monkeypatch.setattr(provider, "bundled_client_path", lambda: str(shipped))
+    assert provider.default_client_path() == str(shipped)
+    assert provider.setup_client(cfg=dict(provider.DEFAULTS)) is True
+    assert "shipped with this install, Google Cloud project proj-777" in capsys.readouterr().out
+    # The user's own client, once stored, wins over the bundled one.
+    own = write_named_client(cfg_dir, "client_secret.json", "111")
+    assert provider.default_client_path() == str(own)
 
 
 def test_setup_is_rerunnable_and_offers_nothing_destructive(tmp_path, monkeypatch, capsys):
@@ -898,7 +953,7 @@ def test_setup_enabling_gmail_reauthorizes_existing_accounts(tmp_path, monkeypat
     cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
     connect(cfg_dir, "me@work.com")
     (cfg_dir / "config.ini").write_text("[search]\nmax_results = 4\n")
-    answers = ["", "", "y", "", "",   # Drive yes, names only, Gmail YES, Calendar no, Contacts no
+    answers = ["", "y", "", "", "",   # Drive yes, Gmail YES, Calendar no, Contacts no, names only
                "",                    # authorize Gmail for me@work.com now? default yes
                "", ""]                # add another? no / skip the test
     _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
@@ -918,7 +973,7 @@ def test_setup_enabling_gmail_reauthorizes_existing_accounts(tmp_path, monkeypat
 def test_setup_fulltext_is_saved_and_asks_for_read_access(tmp_path, monkeypatch):
     cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
     connect(cfg_dir, "old@work.com")
-    answers = ["", "y", "", "", "",   # Drive yes, contents YES
+    answers = ["", "", "", "", "y",   # Drive only, contents YES
                "n",                   # authorize now? no
                "", ""]
     _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
@@ -935,7 +990,8 @@ def test_setup_with_nothing_enabled_stops(tmp_path, monkeypatch, capsys):
 
 
 def test_setup_without_a_client_stops_before_login(tmp_path, monkeypatch, capsys):
-    answers = DRIVE_ONLY + ["/nope.json", ""]  # bad path, then give up
+    answers = DRIVE_ONLY + ["", "", "", "", "/nope.json", ""]
+    #                       no owner / 3 steps / bad path / give up
     _, _, queue, logins = setup_env(tmp_path, monkeypatch, answers, registered=False)
     assert run_setup_with_config() == 1
     assert queue == [] and logins == []
@@ -1305,12 +1361,21 @@ def test_login_with_another_client_never_replaces_the_default(tmp_path, monkeypa
 def test_setup_offers_another_client_when_google_refuses_the_account(tmp_path, monkeypatch, capsys):
     cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
     write_named_client(cfg_dir, "client_secret.json", "111")
-    personal = write_named_client(tmp_path / "Downloads", "client_secret_222.json", "222")
+    downloads = tmp_path / "Downloads"
+    write_named_client(downloads, "client_secret_old.json", "999")  # must never be guessed
+
+    def download():
+        write_named_client(downloads, "client_secret_new.json", "222")
+        return ""
+
     answers = DRIVE_ONLY + [
-        "",   # add an account? default yes
-        "",   # path to another client: accept the one found in ~/Downloads
-        "",   # add another? no
-        "",   # skip the test
+        "",              # add an account? default yes
+        "",              # register another client now? default yes
+        "me@gmail.com",  # owner of the new client
+        "", "", download,
+        "",              # path: accept the fresh download
+        "",              # add another? no
+        "",              # skip the test
     ]
     _, prompts, queue, _ = setup_env(tmp_path, monkeypatch, answers)
     monkeypatch.setattr(provider, "CLIENTS_DIR", str(cfg_dir / "clients"))
@@ -1328,11 +1393,13 @@ def test_setup_offers_another_client_when_google_refuses_the_account(tmp_path, m
     monkeypatch.setattr(provider, "login", picky_login)
     assert run_setup_with_config() == 0
     assert queue == []
-    assert attempts == [None, str(personal)]
+    kept = str(cfg_dir / "clients" / "proj-222.json")
+    assert attempts == [None, kept]  # stored under clients/, the default is untouched
+    assert provider.load_client_secret(str(cfg_dir / "client_secret.json"))["project"] == "proj-111"
     out = capsys.readouterr().out
     assert "Login cancelled." in out
     assert "org_internal" in out and "project proj-111 is Internal" in out
-    assert str(personal) in prompts[6]
+    assert "client_secret_old.json" not in out + "".join(prompts)
     assert "+ me@gmail.com" in out
 
 
@@ -1358,3 +1425,110 @@ def test_setup_reauthorizes_an_account_with_the_client_it_was_connected_with(tmp
     monkeypatch.setattr(provider.GmailService, "search", lambda self, account, terms, cfg: [])
     assert run_setup_with_config() == 0
     assert used == [("me@gmail.com", "222-abc.apps.googleusercontent.com")]
+
+
+# ---------------------------------------------------------------------------
+# Checklist
+# ---------------------------------------------------------------------------
+
+ITEMS = [("drive", "Google Drive", "names"), ("gmail", "Gmail", "ALL your mail"),
+         ("calendar", "Google Calendar", "events")]
+UP, DOWN = "\x1b[A", "\x1b[B"
+
+
+def run_checklist(keys, checked=("drive",), width=80):
+    out = io.StringIO()
+    chosen = provider.checklist(ITEMS, checked, keys=iter(keys).__next__, out=out, width=width)
+    return chosen, out.getvalue()
+
+
+def test_checklist_lines_show_marks_cursor_and_aligned_notes():
+    assert provider.checklist_lines(ITEMS, {"gmail"}, 1) == [
+        "    [ ] Google Drive     names",
+        "  > [x] Gmail            ALL your mail",
+        "    [ ] Google Calendar  events",
+    ]
+    assert provider.checklist_lines(ITEMS, set(), 0, width=24)[0] == "  > [ ] Google Drive   "
+
+
+def test_checklist_moves_toggles_and_confirms():
+    chosen, out = run_checklist([DOWN, " ", DOWN, "x", "\r"])
+    assert chosen == {"drive", "gmail", "calendar"}
+    assert "space or x marks" in out
+    assert out.count("\x1b[3A") == 4          # redrawn in place after each key, not scrolled
+    chosen, _ = run_checklist([" ", "\r"])     # unmark the only one
+    assert chosen == set()
+
+
+def test_checklist_wraps_around_and_supports_vim_keys_and_all():
+    assert run_checklist([UP, " ", "\r"])[0] == {"drive", "calendar"}   # up from the top wraps
+    assert run_checklist(["j", "j", "j", "x", "\n"])[0] == set()         # wraps back to Drive
+    assert run_checklist(["a", "\r"])[0] == {"drive", "gmail", "calendar"}
+    assert run_checklist(["a", "a", "\r"])[0] == set()
+    assert run_checklist(["?", "\x1b", "q", "\r"])[0] == {"drive"}       # unknown keys do nothing
+
+
+def test_checklist_is_not_used_without_a_real_terminal(monkeypatch):
+    assert provider.checklist_available() is False  # pytest's stdin is not a terminal
+    monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.setattr(provider.os, "isatty", lambda fd: True)
+    assert provider.checklist_available() is False
+
+
+def test_setup_picks_services_from_the_checklist_when_the_terminal_allows(tmp_path, monkeypatch, capsys):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    connect(cfg_dir, "me@work.com", provider.SCOPE_METADATA, provider.SCOPE_GMAIL)
+    _, prompts, queue, _ = setup_env(tmp_path, monkeypatch, ["", "", ""])
+    #                        Drive contents? no / add another account? no / skip the test
+    monkeypatch.setattr(provider, "checklist_available", lambda: True)
+    monkeypatch.setattr(provider, "read_key", iter([DOWN, " ", "\r"]).__next__)   # mark Gmail
+    monkeypatch.setattr(provider.GmailService, "search", lambda self, account, terms, cfg: [])
+
+    assert run_setup_with_config() == 0
+    assert queue == []
+    assert not any("Search Gmail?" in p for p in prompts)      # no question per service
+    saved = provider.load_config(provider.CONFIG_PATH)["services"]
+    assert saved == {"drive": True, "gmail": True, "calendar": False, "contacts": False}
+    out = capsys.readouterr().out
+    assert "[x] Gmail" in out and "reads ALL your mail" in out
+    assert "Gmail: needs read access to ALL your mail" in out  # full wording once chosen
+    assert "Google Calendar: needs" not in out
+
+
+def test_checklist_on_a_real_terminal_keeps_every_key_of_a_burst():
+    # Regression: switching terminal modes on every key discarded the pending input,
+    # dropping keys while an arrow was held down. Drive the real termios path in a pty.
+    import pty
+    import select
+    import time
+
+    program = (
+        "import importlib.util, importlib.machinery as m\n"
+        f"l = m.SourceFileLoader('p', {str(SCRIPT)!r}); s = importlib.util.spec_from_loader('p', l)\n"
+        "p = importlib.util.module_from_spec(s); l.exec_module(p)\n"
+        "items = [('a', 'A', ''), ('b', 'B', ''), ('c', 'C', ''), ('d', 'D', '')]\n"
+        "print('CHOSEN', sorted(p.checklist(items, set())))\n"
+    )
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["TERM"] = "xterm"
+        os.execv(sys.executable, [sys.executable, "-c", program])
+    output = b""
+
+    def read_until(marker, seconds):
+        nonlocal output
+        deadline = time.time() + seconds
+        while marker not in output and time.time() < deadline:
+            if select.select([fd], [], [], 0.1)[0]:
+                try:
+                    output += os.read(fd, 65536)
+                except OSError:
+                    break
+        return marker in output
+
+    assert read_until(b"Enter confirms", 20), output
+    time.sleep(0.2)
+    os.write(fd, b"x\x1b[Bx\x1b[B\x1b[Bx\r")  # mark a, b and d, all in one burst
+    assert read_until(b"CHOSEN", 10), output
+    os.waitpid(pid, 0)
+    assert b"CHOSEN ['a', 'b', 'd']" in output

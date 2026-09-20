@@ -24,6 +24,7 @@ import argparse
 import base64
 import concurrent.futures
 import configparser
+import contextlib
 import email.utils
 import hashlib
 import http.server
@@ -88,6 +89,26 @@ ACCOUNTS_DIR = os.path.join(CONFIG_DIR, "accounts")
 CLIENT_SECRET_PATH = os.path.join(CONFIG_DIR, "client_secret.json")
 # Extra OAuth clients, for accounts the default one does not accept.
 CLIENTS_DIR = os.path.join(CONFIG_DIR, "clients")
+# A distribution of this project may ship its own OAuth client, the way rclone or
+# Thunderbird do, so that its users never have to create one. Looked up next to the
+# script (running from a checkout) and in the data directories (installed).
+BUNDLED_CLIENT_NAME = "oauth_client.json"
+
+
+def bundled_client_path():
+    here = os.path.dirname(os.path.realpath(__file__))
+    candidates = [os.path.join(here, "conf", BUNDLED_CLIENT_NAME)]
+    for data_dir in [GLib.get_user_data_dir(), *GLib.get_system_data_dirs()]:
+        candidates.append(os.path.join(data_dir, "gnome-google-workspace-search", BUNDLED_CLIENT_NAME))
+    return next((c for c in candidates if os.path.exists(c)), None)
+
+
+def default_client_path(store=None):
+    """The client to log in with: the user's own if stored, else the bundled one."""
+    store = store or CLIENT_SECRET_PATH
+    if os.path.exists(store):
+        return store
+    return bundled_client_path() or store
 
 # Chromium-family browsers keep one "Local State" file per installation that
 # lists every profile and the Google account signed in to it. Keyed by the
@@ -516,7 +537,7 @@ def remember_client(path, clients_dir=None):
 def known_clients(store=None, clients_dir=None):
     """(client, path) of every stored OAuth client, the default one first."""
     store, clients_dir = store or CLIENT_SECRET_PATH, clients_dir or CLIENTS_DIR
-    paths = [store]
+    paths = [store] + ([bundled_client_path()] if bundled_client_path() else [])
     try:
         paths += sorted(os.path.join(clients_dir, n) for n in os.listdir(clients_dir)
                         if n.endswith(".json"))
@@ -719,7 +740,7 @@ def login(client_secret=None, fulltext=False, port=0, open_browser=True, timeout
     is one already loaded (the one an existing account was connected with).
     """
     store = client_secret_store or CLIENT_SECRET_PATH
-    client = client or load_client_secret(client_secret or store)
+    client = client or load_client_secret(client_secret or default_client_path(store))
     scope = " ".join(scopes) if scopes else (SCOPE_READONLY if fulltext else SCOPE_METADATA)
     verifier, challenge = pkce_pair()
     state = secrets.token_urlsafe(16)
@@ -881,6 +902,7 @@ class Service:
     object_name = ""    # D-Bus object path suffix, also the conf file suffix
     label = ""
     permission = ""     # shown in --setup before the user enables it
+    short = ""          # the same in a few words, for the checklist
     api = ""            # name of the API to enable in Google Cloud
     request_scopes = ()
     accepted_scopes = ()
@@ -927,6 +949,7 @@ class Service:
 
 class DriveService(Service):
     key, object_name, label = "drive", "Drive", "Google Drive"
+    short = "file names, owners and dates"
     permission = "file names, owners and dates (contents only if you ask for it)"
     api = "Google Drive API"
     home_url = "https://drive.google.com/"
@@ -963,6 +986,7 @@ class DriveService(Service):
 
 class GmailService(Service):
     key, object_name, label = "gmail", "Gmail", "Gmail"
+    short = "reads ALL your mail"
     permission = "read access to ALL your mail (Google has no narrower permission that can search)"
     api = "Gmail API"
     home_url = "https://mail.google.com/"
@@ -1027,6 +1051,7 @@ class GmailService(Service):
 
 class CalendarService(Service):
     key, object_name, label = "calendar", "Calendar", "Google Calendar"
+    short = "reads your events"
     permission = "read access to the events of your calendars"
     api = "Google Calendar API"
     home_url = "https://calendar.google.com/"
@@ -1085,6 +1110,7 @@ class CalendarService(Service):
 
 class ContactsService(Service):
     key, object_name, label = "contacts", "Contacts", "Google Contacts"
+    short = "reads contacts, people you wrote to, work directory"
     permission = ("read access to your contacts, the people you have exchanged mail with and, "
                   "on work accounts, your organization's directory")
     api = "People API"
@@ -1266,8 +1292,9 @@ def open_url(url, email=None, cfg=None):
 class AccountManager:
     """Accounts from every source, shared by the providers of all services."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, quiet=False):
         self.cfg = cfg
+        self.quiet = quiet  # the setup says it in its own words
         self.token_file = TokenFile(cfg["token_file"])
         self.last_activity = time.monotonic()
         self._accounts = None
@@ -1304,7 +1331,7 @@ class AccountManager:
             self._known = known
             self._accounts = list(known.values())
             self._accounts_at = time.monotonic()
-            if not self._accounts:
+            if not self._accounts and not self.quiet:
                 log("no Google account: run 'gnome-google-workspace-search --setup'", always=True)
         return self._accounts
 
@@ -1459,18 +1486,15 @@ class SearchProvider:
 # Guided setup
 # ---------------------------------------------------------------------------
 
-CLIENT_GUIDE = """\
-  You need an OAuth client of your own (free, about five minutes, only once):
-    1. https://console.cloud.google.com/ : create a project, then under
-       APIs & Services > Library enable: {apis}.
-    2. APIs & Services > OAuth consent screen: choose External (or Internal for a
-       Google Workspace organization), fill in the name, then press "Publish app".
-       Left in "Testing", Google expires your login every 7 days.
-    3. APIs & Services > Credentials > Create credentials > OAuth client ID,
-       type "Desktop app", and download the JSON file.
-  Full guide: https://github.com/jarrieta86/gnome-google-workspace-search#creating-the-oauth-client
-"""
+API_IDS = {"drive": "drive.googleapis.com", "gmail": "gmail.googleapis.com",
+           "calendar": "calendar-json.googleapis.com", "contacts": "people.googleapis.com"}
 
+WHY_A_CLIENT = """\
+  Google only lets a program ask for access on behalf of an "OAuth client" that is
+  registered in a Google Cloud project. This copy of the project does not ship one,
+  so you register yours: free, about five minutes, only once. No file of yours is
+  involved yet: the client only identifies the app; access is granted later, per
+  account, in your browser."""
 
 REFUSED_HINT = """\
   If Google refused the account, the usual reasons are:
@@ -1499,6 +1523,132 @@ def ask_yes_no(prompt, default=True):
     return answer in ("y", "yes", "s", "si", "sí")
 
 
+# -- checklist ------------------------------------------------------------------
+
+KEYS = {"\x1b[A": "up", "\x1b[B": "down", "\x1bOA": "up", "\x1bOB": "down", "k": "up", "j": "down",
+        " ": "toggle", "x": "toggle", "X": "toggle", "a": "all", "A": "all",
+        "\r": "done", "\n": "done"}
+
+
+def checklist_available():
+    """True on a real terminal that can be driven key by key."""
+    try:
+        import termios  # noqa: F401
+        return (os.isatty(sys.stdin.fileno()) and os.isatty(sys.stdout.fileno())
+                and os.environ.get("TERM", "dumb") != "dumb")
+    except (ImportError, OSError, ValueError, AttributeError):
+        return False
+
+
+@contextlib.contextmanager
+def key_mode():
+    """Deliver keys one by one for the duration of the block, then restore the terminal.
+
+    Entered once per checklist, not once per key: switching modes discards pending
+    input, which would drop keys while an arrow is held down.
+    """
+    try:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+    except (ImportError, OSError, ValueError, AttributeError):
+        yield  # not a terminal (tests, pipes): nothing to switch
+        return
+    try:
+        tty.setcbreak(fd, termios.TCSANOW)  # cbreak keeps Ctrl+C working, unlike raw mode
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, saved)
+
+
+def read_key():
+    """One key press, arrow keys included. Call inside key_mode()."""
+    import select
+
+    fd = sys.stdin.fileno()
+    key = os.read(fd, 1).decode(errors="ignore")
+    if key == "\x1b" and select.select([fd], [], [], 0.05)[0]:
+        # An escape sequence arrives at once; a lone Esc has nothing behind it.
+        key += os.read(fd, 2).decode(errors="ignore")
+    return key
+
+
+def checklist_lines(items, checked, cursor, width=80):
+    lines = []
+    pad = max(len(label) for _key, label, _note in items)
+    for index, (key, label, note) in enumerate(items):
+        mark = "x" if key in checked else " "
+        pointer = ">" if index == cursor else " "
+        lines.append(f"  {pointer} [{mark}] {label.ljust(pad)}  {note}"[:max(width - 1, 20)])
+    return lines
+
+
+def checklist(items, checked, keys=None, out=None, width=None):
+    """Pick any of items = [(key, label, note)]; returns the set of chosen keys.
+
+    Arrows or j/k move, space or x toggles, a toggles all, Enter confirms.
+    """
+    mode = contextlib.nullcontext() if keys else key_mode()
+    keys = keys or read_key
+    out = out or sys.stdout
+    width = width or shutil.get_terminal_size((80, 24)).columns
+    checked, cursor = set(checked), 0
+    out.write("  (arrows move, space or x marks, a marks all, Enter confirms)\n")
+    with mode:
+        return _checklist_loop(items, checked, cursor, keys, out, width)
+
+
+def _checklist_loop(items, checked, cursor, keys, out, width):
+    first = True
+    while True:
+        lines = checklist_lines(items, checked, cursor, width)
+        if not first:
+            out.write(f"\x1b[{len(lines)}A")  # back to the top of the list
+        first = False
+        for index, line in enumerate(lines):
+            style = "\x1b[1m" if index == cursor else ""
+            out.write(f"\r\x1b[2K{style}{line}\x1b[0m\n")
+        out.flush()
+        action = KEYS.get(keys())
+        if action == "up":
+            cursor = (cursor - 1) % len(items)
+        elif action == "down":
+            cursor = (cursor + 1) % len(items)
+        elif action == "toggle":
+            checked ^= {items[cursor][0]}
+        elif action == "all":
+            everything = {key for key, _label, _note in items}
+            checked = set() if checked == everything else everything
+        elif action == "done":
+            return checked
+
+
+def choose_services(cfg):
+    """Step 2 of the setup: which services to search."""
+    if checklist_available():
+        items = [(s.key, s.label, s.short) for s in SERVICES]
+        current = {k for k, enabled in cfg["services"].items() if enabled}
+        chosen = checklist(items, current)
+        for service in SERVICES:
+            cfg["services"][service.key] = service.key in chosen
+        for service in enabled_services(cfg):
+            print(f"  {service.label}: needs {service.permission}.")
+    else:
+        # Plain question per service, for terminals that cannot be driven key by key.
+        for service in SERVICES:
+            print(f"  {service.label}: needs {service.permission}.")
+            cfg["services"][service.key] = ask_yes_no(
+                f"    Search {service.label}?", cfg["services"].get(service.key, False))
+    if cfg["services"]["drive"]:
+        fulltext = ask_yes_no("  Drive: also search inside file contents? Slower, and needs read "
+                              "access to your files instead of names only", cfg["mode"] == "fulltext")
+        cfg["mode"] = "fulltext" if fulltext else "name"
+    else:
+        cfg["mode"] = "name"
+
+
 def provider_registration(service=None):
     """Path of the .ini GNOME Shell will load for a service, or None if it cannot see it."""
     service = service or SERVICES_BY_KEY["drive"]
@@ -1510,7 +1660,11 @@ def provider_registration(service=None):
     return None
 
 
-def find_client_secret_candidates(home=None):
+def find_client_secret_candidates(home=None, since=0.0):
+    """client_secret*.json files in ~/Downloads, newest first, downloaded after `since`.
+
+    Older files are never offered: they belong to who knows which project.
+    """
     downloads = os.path.join(home or os.path.expanduser("~"), "Downloads")
     try:
         names = [n for n in os.listdir(downloads)
@@ -1518,42 +1672,91 @@ def find_client_secret_candidates(home=None):
     except OSError:
         return []
     paths = [os.path.join(downloads, n) for n in names]
+    paths = [p for p in paths if os.path.getmtime(p) >= since]
     return sorted(paths, key=os.path.getmtime, reverse=True)
 
 
-def setup_client(store=None, cfg=None):
-    """Make sure a valid OAuth client is stored; returns False if the user gives up."""
-    store = store or CLIENT_SECRET_PATH
-    apis = ", ".join(s.api for s in enabled_services(cfg or DEFAULTS)) or DriveService.api
-    if os.path.exists(store):
-        try:
-            load_client_secret(store)
-            print(f"  OAuth client: ready ({store})")
-            print(f"  Its Google Cloud project must have these APIs enabled: {apis}.")
-            return True
-        except LoginError as e:
-            print(f"  The stored OAuth client is unusable: {e}")
-    print(CLIENT_GUIDE.format(apis=apis))
-    candidates = find_client_secret_candidates()
+def creation_steps(cfg):
+    """(title, url, instructions) of each page to visit to register an OAuth client."""
+    apis = ",".join(API_IDS[s.key] for s in enabled_services(cfg)) or API_IDS["drive"]
+    names = ", ".join(s.api for s in enabled_services(cfg)) or DriveService.api
+    return [
+        ("Project and APIs",
+         "https://console.cloud.google.com/flows/enableapi?apiid=" + apis,
+         [f"Pick 'Create project' (any name), continue, and press Enable. This turns on: {names}.",
+          "A first-time Google Cloud user is asked to accept its terms; no billing is needed."]),
+        ("Consent screen",
+         "https://console.cloud.google.com/auth/overview",
+         ["Press 'Get started'. App name: anything, it is what the login page will show.",
+          "Audience: External. (Internal only accepts accounts of one Workspace organization.)",
+          "Finish, then open 'Audience' in the left menu and press 'Publish app'.",
+          "Skipping 'Publish app' leaves it in Testing: logins expire every 7 days."]),
+        ("OAuth client",
+         "https://console.cloud.google.com/auth/clients/create",
+         ["Application type: 'Desktop app'. Create, then 'Download JSON'.",
+          "Leave the file in your Downloads folder; the next step picks it up."]),
+    ]
+
+
+def guide_client_creation(cfg):
+    """Walk through registering an OAuth client in the browser; returns its path or None."""
+    started = time.time()
+    print(WHY_A_CLIENT)
+    owner = ask("\n  Google account that will own the client (a personal one accepts any account "
+                "later; empty to skip opening pages)")
+    for number, (title, url, lines) in enumerate(creation_steps(cfg), 1):
+        print(f"\n  Step {number} of 3: {title}")
+        target = account_url(url, owner or None)
+        print(f"    {target}")
+        for line in lines:
+            print(f"    - {line}")
+        if owner:
+            try:
+                open_url(target, owner, cfg)
+            except GLib.Error as e:
+                print(f"    (could not open the browser: {e.message}; open the link yourself)")
+        ask("    Press Enter when that is done")
     while True:
-        path = ask("  Path to the downloaded client JSON (empty to stop)",
-                   candidates[0] if candidates else "")
+        fresh = find_client_secret_candidates(since=started)
+        path = ask("\n  Path to the JSON you just downloaded (empty to stop)", fresh[0] if fresh else "")
         if not path:
-            return False
+            return None
         path = os.path.expanduser(path)
         try:
             client = load_client_secret(path)
         except LoginError as e:
             print(f"  {e}")
-            candidates = []
             continue
         if client["kind"] == "web":
-            print("  Note: that is a 'Web application' client; a 'Desktop app' one is simpler.")
-        os.makedirs(os.path.dirname(store), mode=0o700, exist_ok=True)
-        shutil.copyfile(path, store)
-        os.chmod(store, 0o600)
-        print(f"  OAuth client saved to {store}")
-        return True
+            print("  That is a 'Web application' client; this needs a 'Desktop app' one. Create it "
+                  "again with the right type.")
+            continue
+        return path
+
+
+def setup_client(store=None, cfg=None):
+    """Make sure there is an OAuth client to log in with; False if the user gives up."""
+    store = store or CLIENT_SECRET_PATH
+    cfg = cfg or DEFAULTS
+    apis = ", ".join(s.api for s in enabled_services(cfg)) or DriveService.api
+    current = default_client_path(store)
+    if os.path.exists(current):
+        try:
+            client = load_client_secret(current)
+            origin = "yours" if current == store else "shipped with this install"
+            print(f"  OAuth client: ready ({origin}, Google Cloud project {client['project']})")
+            print(f"  That project must have these APIs enabled: {apis}.")
+            return True
+        except LoginError as e:
+            print(f"  The stored OAuth client is unusable: {e}")
+    path = guide_client_creation(cfg)
+    if not path:
+        return False
+    os.makedirs(os.path.dirname(store), mode=0o700, exist_ok=True)
+    shutil.copyfile(path, store)
+    os.chmod(store, 0o600)
+    print(f"  OAuth client saved to {store}")
+    return True
 
 
 def save_preferences(cfg, path=None):
@@ -1629,15 +1832,7 @@ def _setup_steps(cfg, config_path):
               "  Run ./install.sh from the project directory and follow its last step.")
 
     print("\n2. Services (each one is its own section in the overview)")
-    for service in SERVICES:
-        print(f"  {service.label}: needs {service.permission}.")
-        cfg["services"][service.key] = ask_yes_no(
-            f"    Search {service.label}?", cfg["services"].get(service.key, False))
-        if service.key == "drive" and cfg["services"]["drive"]:
-            fulltext = ask_yes_no("    Also search inside file contents? Slower, and needs read "
-                                  "access to your files instead of names only",
-                                  cfg["mode"] == "fulltext")
-            cfg["mode"] = "fulltext" if fulltext else "name"
+    choose_services(cfg)
     if not enabled_services(cfg):
         print("  Nothing enabled, so there is nothing to search. Run --setup again to change it.")
         save_preferences(cfg, config_path)
@@ -1648,14 +1843,14 @@ def _setup_steps(cfg, config_path):
     have_client = setup_client(cfg=cfg)
 
     print("\n4. Google accounts")
-    manager = AccountManager(cfg)
+    manager = AccountManager(cfg, quiet=True)
     scopes = login_scopes(cfg)
 
     def connect(hint=None):
         # An account is authorized again with the client it was connected with.
         client, path, tried = (client_of_account(hint) if hint else None), None, set()
         while True:
-            using = client or load_client_secret(path or CLIENT_SECRET_PATH)
+            using = client or load_client_secret(path or default_client_path())
             tried.add(using["client_id"])
             try:
                 address = login(client_secret=path, client=client, scopes=scopes, login_hint=hint)
@@ -1666,14 +1861,15 @@ def _setup_steps(cfg, config_path):
                 print(f"  Login failed: {e}")
             print(REFUSED_HINT.format(project=using["project"]))
             others = [p for c, p in known_clients() if c["client_id"] not in tried]
-            for candidate in find_client_secret_candidates():
-                try:
-                    if load_client_secret(candidate)["client_id"] not in tried:
-                        others.append(candidate)
-                except LoginError:
-                    pass
-            path = os.path.expanduser(ask("  Path to another OAuth client for this account "
-                                          "(empty to skip it)", others[0] if others else ""))
+            if others:
+                path = os.path.expanduser(ask("  Path to another OAuth client for this account "
+                                              "(empty to skip it)", others[0]))
+            elif ask_yes_no("  Register another OAuth client now, for this account?", True):
+                path = guide_client_creation(cfg)
+                if path:
+                    path = remember_client(path)
+            else:
+                path = ""
             if not path:
                 return
             try:
