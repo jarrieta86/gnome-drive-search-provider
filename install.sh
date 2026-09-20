@@ -52,8 +52,8 @@ if [[ -n "${PROVIDERDIR:-}" ]]; then
   echo "  $PROVIDERDIR/$ID.ini"
   cat <<MSG
 
-Next: add your Google account in Settings > Online Accounts (with Files enabled),
-then open the Activities overview and type part of a file name.
+Next: connect your Google accounts with: gnome-drive-search-provider --login
+(see the README), then open the Activities overview and type part of a file name.
 GNOME Shell picks the provider up right away; if the "Google Drive" section does
 not appear, check Settings > Search, or log out and back in.
 MSG

@@ -4,24 +4,30 @@
 Implements org.gnome.Shell.SearchProvider2 over D-Bus so that typing in the
 Activities overview searches the files in your Google Drive.
 
-Authentication, in order of preference:
+Accounts are added with ``--login``, which runs the OAuth flow in your browser
+using your own OAuth client and stores one token file per account under
+``~/.config/gnome-drive-search-provider/accounts``. Every logged-in account is
+searched. Two more sources are supported for compatibility:
 
-1. GNOME Online Accounts: every Google account added in Settings > Online
-   Accounts with "Files" enabled is searched. No configuration needed.
-2. A token file in the "authorized_user" JSON format produced by google-auth,
-   gcloud and similar tools (fields: client_id, client_secret, refresh_token).
-   Configure it with ``token_file`` in the config file or with the
-   ``GNOME_DRIVE_SEARCH_TOKEN_FILE`` environment variable.
+- ``auth.token_file``: an existing "authorized_user" JSON token (google-auth).
+- GNOME Online Accounts, on the old GNOME releases whose Google tokens still
+  carry a Drive scope. Current releases do not, and such accounts are skipped.
 
 The process is started on demand by D-Bus activation and exits after a period
 of inactivity.
 """
 
 import argparse
+import base64
+import concurrent.futures
 import configparser
+import hashlib
+import http.server
 import json
 import locale
 import os
+import secrets
+import shutil
 import sys
 import threading
 import time
@@ -47,11 +53,19 @@ GOA_OAUTH2_IFACE = "org.gnome.OnlineAccounts.OAuth2Based"
 
 DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 DRIVE_FIELDS = "files(id,name,mimeType,webViewLink,modifiedTime,owners(displayName))"
+DRIVE_ABOUT_URL = "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)"
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 
-CONFIG_PATH = os.path.join(
-    GLib.get_user_config_dir(), "gnome-drive-search-provider", "config.ini"
-)
+# Least privilege: file names and metadata only. Full-text search needs read access.
+SCOPE_METADATA = "https://www.googleapis.com/auth/drive.metadata.readonly"
+SCOPE_READONLY = "https://www.googleapis.com/auth/drive.readonly"
+
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "gnome-drive-search-provider")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.ini")
+ACCOUNTS_DIR = os.path.join(CONFIG_DIR, "accounts")
+CLIENT_SECRET_PATH = os.path.join(CONFIG_DIR, "client_secret.json")
 
 DEFAULTS = {
     "mode": "name",  # "name" matches file names, "fulltext" also matches content
@@ -227,11 +241,18 @@ def kind_label(mime, lang):
 class Account:
     """A Google account we can search, with a way to get a fresh access token."""
 
-    def __init__(self, identity, token_getter):
+    def __init__(self, identity, token_getter, source="login"):
         self.identity = identity
+        self.source = source
+        # Set when Google says the token cannot access Drive, so we stop asking.
+        self.disabled = False
         self._token_getter = token_getter
         self._token = None
         self._expires_at = 0.0
+
+    @property
+    def email(self):
+        return self.identity if "@" in self.identity else None
 
     def token(self, force=False):
         if force or self._token is None or time.monotonic() >= self._expires_at:
@@ -263,7 +284,7 @@ def goa_accounts(bus=None):
         if props.get("FilesDisabled") or GOA_OAUTH2_IFACE not in ifaces:
             continue
         identity = props.get("PresentationIdentity") or props.get("Identity") or path
-        accounts.append(Account(identity, _goa_token_getter(bus, path)))
+        accounts.append(Account(identity, _goa_token_getter(bus, path), source="goa"))
     return accounts
 
 
@@ -289,15 +310,18 @@ def _goa_token_getter(bus, path):
 class TokenFile:
     """OAuth refresh-token file in google-auth "authorized_user" format."""
 
-    def __init__(self, path):
+    def __init__(self, path, identity=None, source="token_file"):
         self.path = path
+        self.identity = identity
+        self.source = source
         self.lock = threading.Lock()
         self.data = None
 
     def account(self):
         if not self.path or not os.path.exists(self.path):
             return None
-        return Account(os.path.basename(self.path), self.fresh_token)
+        identity = self.identity or os.path.basename(self.path)
+        return Account(identity, self.fresh_token, source=self.source)
 
     def _load(self):
         with open(self.path) as f:
@@ -343,12 +367,260 @@ class TokenFile:
         self.data["token"] = payload["access_token"]
         exp = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
         self.data["expiry"] = exp.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.data, f, indent=2)
-        os.replace(tmp, self.path)
+        write_private_json(self.path, self.data)
         log("token file refreshed")
         return self.data["token"], expires_in
+
+
+def write_private_json(path, data):
+    """Atomically write JSON readable only by the user (or keep the file's mode)."""
+    mode = 0o600
+    if os.path.exists(path):
+        mode = os.stat(path).st_mode & 0o777
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Login: OAuth 2.0 for desktop apps (loopback redirect + PKCE)
+# ---------------------------------------------------------------------------
+
+
+class LoginError(Exception):
+    pass
+
+
+def load_client_secret(path):
+    """Read a Google OAuth client JSON ("Desktop app" download)."""
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raise LoginError(
+            f"no OAuth client found at {path}. Pass --client-secret FILE the first "
+            "time you log in (see the README for how to create one)."
+        ) from None
+    except ValueError as e:
+        raise LoginError(f"{path} is not valid JSON: {e}") from None
+    kind = "installed" if "installed" in raw else "web" if "web" in raw else None
+    client = raw.get(kind, raw) if kind else raw
+    for key in ("client_id", "client_secret"):
+        if not client.get(key):
+            raise LoginError(f"{path} has no {key!r}; download the OAuth client JSON again")
+    return {
+        "client_id": client["client_id"],
+        "client_secret": client["client_secret"],
+        "token_uri": client.get("token_uri") or TOKEN_URL,
+        "kind": kind or "installed",
+    }
+
+
+def pkce_pair():
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def build_auth_url(client, redirect_uri, scope, state, challenge, login_hint=None):
+    params = {
+        "client_id": client["client_id"],
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": scope,
+        "access_type": "offline",
+        # Always ask for consent so Google returns a refresh token every time.
+        "prompt": "consent select_account",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    if login_hint:
+        params["login_hint"] = login_hint
+    return AUTH_URL + "?" + urllib.parse.urlencode(params)
+
+
+def _post_form(url, fields):
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:300].decode(errors="replace")
+        raise LoginError(f"Google rejected the request (HTTP {e.code}): {detail}") from None
+
+
+def exchange_code(client, code, verifier, redirect_uri):
+    payload = _post_form(client["token_uri"], {
+        "grant_type": "authorization_code",
+        "code": code,
+        "code_verifier": verifier,
+        "client_id": client["client_id"],
+        "client_secret": client["client_secret"],
+        "redirect_uri": redirect_uri,
+    })
+    if not payload.get("refresh_token"):
+        raise LoginError("Google did not return a refresh token; try --login again")
+    return payload
+
+
+def fetch_email(access_token):
+    req = urllib.request.Request(
+        DRIVE_ABOUT_URL, headers={"Authorization": f"Bearer {access_token}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.load(resp)["user"]["emailAddress"]
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:300].decode(errors="replace")
+        raise LoginError(
+            f"logged in, but Drive refused the token (HTTP {e.code}). Is the Google Drive "
+            f"API enabled in your Google Cloud project? {detail}"
+        ) from None
+
+
+def wait_for_redirect(server, state, timeout):
+    """Serve the loopback redirect until Google sends us the code."""
+    result = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if "code" not in query and "error" not in query:
+                self.send_error(404)  # favicon and friends
+                return
+            if query.get("state", [""])[0] != state:
+                result["error"] = "state mismatch"
+            elif "error" in query:
+                result["error"] = query["error"][0]
+            else:
+                result["code"] = query["code"][0]
+            ok = "code" in result
+            body = (
+                "<html><body style='font-family:sans-serif;margin:3em'><h2>"
+                + ("Google Drive search: account connected" if ok else "Login failed")
+                + "</h2><p>"
+                + ("You can close this tab." if ok else result.get("error", ""))
+                + "</p></body></html>"
+            ).encode()
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server.RequestHandlerClass = Handler
+    deadline = time.monotonic() + timeout
+    while not result and time.monotonic() < deadline:
+        server.timeout = max(0.1, min(1.0, deadline - time.monotonic()))
+        server.handle_request()
+    if "code" in result:
+        return result["code"]
+    raise LoginError(result.get("error") or "timed out waiting for the browser")
+
+
+def account_path(email, accounts_dir=None):
+    safe = "".join(c for c in email.lower() if c.isalnum() or c in "@._-+")
+    return os.path.join(accounts_dir or ACCOUNTS_DIR, safe + ".json")
+
+
+def save_account(email, client, payload, scope, accounts_dir=None):
+    accounts_dir = accounts_dir or ACCOUNTS_DIR
+    os.makedirs(accounts_dir, mode=0o700, exist_ok=True)
+    os.chmod(accounts_dir, 0o700)
+    expires_in = int(payload.get("expires_in", 3600))
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    data = {
+        "type": "authorized_user",
+        "account": email,
+        "client_id": client["client_id"],
+        "client_secret": client["client_secret"],
+        "token_uri": client["token_uri"],
+        "refresh_token": payload["refresh_token"],
+        "token": payload["access_token"],
+        "expiry": expiry.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "scopes": (payload.get("scope") or scope).split(),
+    }
+    path = account_path(email, accounts_dir)
+    if os.path.exists(path):
+        os.chmod(path, 0o600)
+    write_private_json(path, data)
+    return path
+
+
+def stored_accounts(accounts_dir=None):
+    """Accounts added with --login, one JSON file each, named after the email."""
+    accounts_dir = accounts_dir or ACCOUNTS_DIR
+    try:
+        names = sorted(n for n in os.listdir(accounts_dir) if n.endswith(".json"))
+    except FileNotFoundError:
+        return []
+    found = []
+    for name in names:
+        token_file = TokenFile(os.path.join(accounts_dir, name), identity=name[:-5], source="login")
+        found.append(token_file.account())
+    return found
+
+
+def login(client_secret=None, fulltext=False, port=0, open_browser=True, timeout=300,
+          accounts_dir=None, client_secret_store=None):
+    """Add (or re-authorize) a Google account. Returns its email."""
+    store = client_secret_store or CLIENT_SECRET_PATH
+    client = load_client_secret(client_secret or store)
+    scope = SCOPE_READONLY if fulltext else SCOPE_METADATA
+    verifier, challenge = pkce_pair()
+    state = secrets.token_urlsafe(16)
+
+    server = http.server.HTTPServer(("127.0.0.1", port), http.server.BaseHTTPRequestHandler)
+    try:
+        redirect_uri = f"http://127.0.0.1:{server.server_port}"
+        url = build_auth_url(client, redirect_uri, scope, state, challenge)
+        print("Open this link in the browser profile of the account you want to add:\n")
+        print(f"  {url}\n")
+        if client["kind"] == "web" and not port:
+            print("Note: this is a 'Web application' OAuth client. Google will only accept the\n"
+                  "redirect if it is registered; use --port with a registered port, or create a\n"
+                  "'Desktop app' client instead.\n")
+        if open_browser:
+            try:
+                Gio.AppInfo.launch_default_for_uri(url, None)
+            except GLib.Error:
+                pass
+        print("Waiting for you to approve access...", flush=True)
+        code = wait_for_redirect(server, state, timeout)
+    finally:
+        server.server_close()
+
+    payload = exchange_code(client, code, verifier, redirect_uri)
+    email = fetch_email(payload["access_token"])
+    path = save_account(email, client, payload, scope, accounts_dir)
+    if client_secret and os.path.abspath(client_secret) != os.path.abspath(store):
+        os.makedirs(os.path.dirname(store), exist_ok=True)
+        shutil.copyfile(client_secret, store)
+        os.chmod(store, 0o600)
+    print(f"Connected {email} (token saved to {path}).")
+    return email
+
+
+def logout(email, accounts_dir=None):
+    path = account_path(email, accounts_dir)
+    if not os.path.exists(path):
+        raise LoginError(f"no account {email!r}; see --accounts")
+    try:
+        with open(path) as f:
+            refresh_token = json.load(f).get("refresh_token")
+        if refresh_token:
+            _post_form(REVOKE_URL, {"token": refresh_token})
+    except (LoginError, OSError, ValueError) as e:
+        log(f"could not revoke the token at Google: {e}", always=True)
+    os.remove(path)
+    print(f"Removed {email}.")
 
 
 # ---------------------------------------------------------------------------
@@ -396,9 +668,29 @@ def drive_search(account, terms, cfg, opener=urllib.request.urlopen):
         except urllib.error.HTTPError as e:
             if e.code == 401 and attempt == 0:
                 continue
-            log(f"[{account.identity}] HTTP {e.code}: {e.read()[:200]!r}", always=True)
+            body = e.read()[:400].decode(errors="replace")
+            if e.code == 403 and "insufficient" in body.lower():
+                account.disabled = True
+                hint = ("GNOME Online Accounts no longer grants Drive access; use --login instead"
+                        if account.source == "goa" else
+                        "log in again, adding --fulltext if you use mode = fulltext")
+                log(f"[{account.identity}] token lacks the Drive permission for this search, "
+                    f"skipping this account: {hint}", always=True)
+            else:
+                log(f"[{account.identity}] HTTP {e.code}: {body[:200]!r}", always=True)
             return []
     return []
+
+
+def account_url(url, email):
+    """Make the browser open the file with the account that can see it."""
+    if not email:
+        return url
+    parts = urllib.parse.urlsplit(url)
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+             if k != "authuser"]
+    query.append(("authuser", email))
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
 
 
 # ---------------------------------------------------------------------------
@@ -418,23 +710,32 @@ class SearchProvider:
         self.last_activity = time.monotonic()
         self._accounts = None
         self._accounts_at = 0.0
+        self._known = {}
         GLib.timeout_add_seconds(30, self._maybe_exit)
 
     # -- accounts -----------------------------------------------------------
 
     def accounts(self):
-        # Re-read GOA every minute so newly added accounts show up without a restart.
+        """Usable accounts. Re-read every minute so --login shows up without a restart."""
         if self._accounts is None or time.monotonic() - self._accounts_at > 60:
-            accounts = goa_accounts()
+            found = stored_accounts()
             fallback = self.token_file.account()
             if fallback is not None:
-                accounts.append(fallback)
-            if not accounts:
-                log("no Google account found: add one in Settings > Online Accounts "
-                    "or set auth.token_file", always=True)
-            self._accounts = accounts
+                found.append(fallback)
+            logged_in = {a.identity.lower() for a in found}
+            found += [a for a in goa_accounts() if a.identity.lower() not in logged_in]
+            # Keep the objects we already know: they hold cached tokens and the
+            # "disabled" flag of accounts that cannot access Drive.
+            known = {}
+            for account in found:
+                key = (account.source, account.identity)
+                known[key] = self._known.get(key, account)
+            self._known = known
+            self._accounts = list(known.values())
             self._accounts_at = time.monotonic()
-        return self._accounts
+            if not self._accounts:
+                log("no Google account: run 'gnome-drive-search-provider --login'", always=True)
+        return [a for a in self._accounts if not a.disabled]
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -485,15 +786,7 @@ class SearchProvider:
             return False
 
         def work():
-            results = []
-            for account in self.accounts():
-                try:
-                    for f in drive_search(account, query, self.cfg):
-                        f["_account"] = account.identity
-                        results.append(f)
-                except Exception as e:  # noqa: BLE001
-                    log(f"[{account.identity}] search failed: {e!r}", always=True)
-            GLib.idle_add(finish, results)
+            GLib.idle_add(finish, self.search_all(query))
 
         def finish(results):
             if seq != self.seq:
@@ -510,6 +803,26 @@ class SearchProvider:
             return False
 
         GLib.timeout_add(self.cfg["debounce_ms"], fire)
+
+    def search_all(self, terms):
+        """Search every account at once; one slow or broken account does not block the rest."""
+        accounts = self.accounts()
+        if not accounts:
+            return []
+
+        def one(account):
+            try:
+                files = drive_search(account, terms, self.cfg)
+            except Exception as e:  # noqa: BLE001
+                log(f"[{account.identity}] search failed: {e!r}", always=True)
+                return []
+            for f in files:
+                f["_account"] = account.identity
+                f["_email"] = account.email
+            return files
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(accounts)) as pool:
+            return [f for files in pool.map(one, accounts) for f in files]
 
     # -- SearchProvider2 methods --------------------------------------------
 
@@ -545,7 +858,7 @@ class SearchProvider:
         (fid, _terms, _ts) = params.unpack()
         f = self.files.get(fid, {})
         url = f.get("webViewLink") or f"https://drive.google.com/open?id={fid}"
-        self._open(url)
+        self._open(account_url(url, f.get("_email")))
         invocation.return_value(None)
 
     def LaunchSearch(self, params, invocation):
@@ -572,6 +885,19 @@ def parse_args(argv):
         "--query", nargs="+", metavar="TERM",
         help="run one search from the command line and print the results (for debugging)",
     )
+    auth = parser.add_argument_group("accounts")
+    auth.add_argument("--login", action="store_true",
+                      help="add a Google account (run it once per account)")
+    auth.add_argument("--client-secret", metavar="FILE",
+                      help="OAuth client JSON from Google Cloud; only needed on the first --login")
+    auth.add_argument("--fulltext", action="store_true",
+                      help="with --login: also request read access, needed for mode = fulltext")
+    auth.add_argument("--port", type=int, default=0,
+                      help="with --login: fixed loopback port (only for 'Web application' clients)")
+    auth.add_argument("--no-browser", action="store_true",
+                      help="with --login: only print the link, do not open a browser")
+    auth.add_argument("--accounts", action="store_true", help="list the accounts being searched")
+    auth.add_argument("--logout", metavar="EMAIL", help="remove an account and revoke its token")
     return parser.parse_args(argv)
 
 
@@ -580,11 +906,24 @@ def run_query(cfg, terms):
     accounts = provider.accounts()
     if not accounts:
         return 1
-    for account in accounts:
-        for f in drive_search(account, terms, cfg):
-            meta = provider.result_meta(f, len(accounts) > 1)
-            print(f"{meta['name'].get_string()}\n    {meta['description'].get_string()}\n"
-                  f"    {f.get('webViewLink', '')}")
+    files = provider.search_all(terms)
+    files.sort(key=lambda f: f.get("modifiedTime", ""), reverse=True)
+    for f in files:
+        meta = provider.result_meta(f, len(accounts) > 1)
+        url = account_url(f.get("webViewLink", ""), f.get("_email"))
+        print(f"{meta['name'].get_string()}\n    {meta['description'].get_string()}\n    {url}")
+    return 0
+
+
+def run_accounts(cfg):
+    provider = SearchProvider(GLib.MainLoop(), cfg)
+    provider.accounts()
+    labels = {"login": "--login", "token_file": "auth.token_file", "goa": "GNOME Online Accounts"}
+    if not provider._accounts:
+        print("No accounts. Add one with: gnome-drive-search-provider --login")
+        return 1
+    for account in provider._accounts:
+        print(f"{account.identity}  ({labels.get(account.source, account.source)})")
     return 0
 
 
@@ -593,6 +932,19 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     VERBOSE = args.verbose
     cfg = load_config(args.config)
+    try:
+        if args.login:
+            login(args.client_secret, fulltext=args.fulltext, port=args.port,
+                  open_browser=not args.no_browser)
+            return 0
+        if args.logout:
+            logout(args.logout)
+            return 0
+    except LoginError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    if args.accounts:
+        return run_accounts(cfg)
     if args.query:
         return run_query(cfg, args.query)
 
