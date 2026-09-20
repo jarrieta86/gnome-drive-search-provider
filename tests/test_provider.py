@@ -798,7 +798,8 @@ def test_activate_result_passes_the_account_to_the_opener(monkeypatch):
 # Guided setup
 # ---------------------------------------------------------------------------
 
-# Answers to step 2 of --setup: Drive?, contents?, Gmail?, Calendar?, Contacts?
+# Answers to step 2 of --setup without a key-driven terminal:
+# Drive?, Gmail?, Calendar?, Contacts?, then Drive contents?
 DRIVE_ONLY = ["", "", "", "", ""]
 
 
@@ -952,7 +953,7 @@ def test_setup_enabling_gmail_reauthorizes_existing_accounts(tmp_path, monkeypat
     cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
     connect(cfg_dir, "me@work.com")
     (cfg_dir / "config.ini").write_text("[search]\nmax_results = 4\n")
-    answers = ["", "", "y", "", "",   # Drive yes, names only, Gmail YES, Calendar no, Contacts no
+    answers = ["", "y", "", "", "",   # Drive yes, Gmail YES, Calendar no, Contacts no, names only
                "",                    # authorize Gmail for me@work.com now? default yes
                "", ""]                # add another? no / skip the test
     _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
@@ -972,7 +973,7 @@ def test_setup_enabling_gmail_reauthorizes_existing_accounts(tmp_path, monkeypat
 def test_setup_fulltext_is_saved_and_asks_for_read_access(tmp_path, monkeypatch):
     cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
     connect(cfg_dir, "old@work.com")
-    answers = ["", "y", "", "", "",   # Drive yes, contents YES
+    answers = ["", "", "", "", "y",   # Drive only, contents YES
                "n",                   # authorize now? no
                "", ""]
     _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
@@ -1424,3 +1425,110 @@ def test_setup_reauthorizes_an_account_with_the_client_it_was_connected_with(tmp
     monkeypatch.setattr(provider.GmailService, "search", lambda self, account, terms, cfg: [])
     assert run_setup_with_config() == 0
     assert used == [("me@gmail.com", "222-abc.apps.googleusercontent.com")]
+
+
+# ---------------------------------------------------------------------------
+# Checklist
+# ---------------------------------------------------------------------------
+
+ITEMS = [("drive", "Google Drive", "names"), ("gmail", "Gmail", "ALL your mail"),
+         ("calendar", "Google Calendar", "events")]
+UP, DOWN = "\x1b[A", "\x1b[B"
+
+
+def run_checklist(keys, checked=("drive",), width=80):
+    out = io.StringIO()
+    chosen = provider.checklist(ITEMS, checked, keys=iter(keys).__next__, out=out, width=width)
+    return chosen, out.getvalue()
+
+
+def test_checklist_lines_show_marks_cursor_and_aligned_notes():
+    assert provider.checklist_lines(ITEMS, {"gmail"}, 1) == [
+        "    [ ] Google Drive     names",
+        "  > [x] Gmail            ALL your mail",
+        "    [ ] Google Calendar  events",
+    ]
+    assert provider.checklist_lines(ITEMS, set(), 0, width=24)[0] == "  > [ ] Google Drive   "
+
+
+def test_checklist_moves_toggles_and_confirms():
+    chosen, out = run_checklist([DOWN, " ", DOWN, "x", "\r"])
+    assert chosen == {"drive", "gmail", "calendar"}
+    assert "space or x marks" in out
+    assert out.count("\x1b[3A") == 4          # redrawn in place after each key, not scrolled
+    chosen, _ = run_checklist([" ", "\r"])     # unmark the only one
+    assert chosen == set()
+
+
+def test_checklist_wraps_around_and_supports_vim_keys_and_all():
+    assert run_checklist([UP, " ", "\r"])[0] == {"drive", "calendar"}   # up from the top wraps
+    assert run_checklist(["j", "j", "j", "x", "\n"])[0] == set()         # wraps back to Drive
+    assert run_checklist(["a", "\r"])[0] == {"drive", "gmail", "calendar"}
+    assert run_checklist(["a", "a", "\r"])[0] == set()
+    assert run_checklist(["?", "\x1b", "q", "\r"])[0] == {"drive"}       # unknown keys do nothing
+
+
+def test_checklist_is_not_used_without_a_real_terminal(monkeypatch):
+    assert provider.checklist_available() is False  # pytest's stdin is not a terminal
+    monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.setattr(provider.os, "isatty", lambda fd: True)
+    assert provider.checklist_available() is False
+
+
+def test_setup_picks_services_from_the_checklist_when_the_terminal_allows(tmp_path, monkeypatch, capsys):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    connect(cfg_dir, "me@work.com", provider.SCOPE_METADATA, provider.SCOPE_GMAIL)
+    _, prompts, queue, _ = setup_env(tmp_path, monkeypatch, ["", "", ""])
+    #                        Drive contents? no / add another account? no / skip the test
+    monkeypatch.setattr(provider, "checklist_available", lambda: True)
+    monkeypatch.setattr(provider, "read_key", iter([DOWN, " ", "\r"]).__next__)   # mark Gmail
+    monkeypatch.setattr(provider.GmailService, "search", lambda self, account, terms, cfg: [])
+
+    assert run_setup_with_config() == 0
+    assert queue == []
+    assert not any("Search Gmail?" in p for p in prompts)      # no question per service
+    saved = provider.load_config(provider.CONFIG_PATH)["services"]
+    assert saved == {"drive": True, "gmail": True, "calendar": False, "contacts": False}
+    out = capsys.readouterr().out
+    assert "[x] Gmail" in out and "reads ALL your mail" in out
+    assert "Gmail: needs read access to ALL your mail" in out  # full wording once chosen
+    assert "Google Calendar: needs" not in out
+
+
+def test_checklist_on_a_real_terminal_keeps_every_key_of_a_burst():
+    # Regression: switching terminal modes on every key discarded the pending input,
+    # dropping keys while an arrow was held down. Drive the real termios path in a pty.
+    import pty
+    import select
+    import time
+
+    program = (
+        "import importlib.util, importlib.machinery as m\n"
+        f"l = m.SourceFileLoader('p', {str(SCRIPT)!r}); s = importlib.util.spec_from_loader('p', l)\n"
+        "p = importlib.util.module_from_spec(s); l.exec_module(p)\n"
+        "items = [('a', 'A', ''), ('b', 'B', ''), ('c', 'C', ''), ('d', 'D', '')]\n"
+        "print('CHOSEN', sorted(p.checklist(items, set())))\n"
+    )
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["TERM"] = "xterm"
+        os.execv(sys.executable, [sys.executable, "-c", program])
+    output = b""
+
+    def read_until(marker, seconds):
+        nonlocal output
+        deadline = time.time() + seconds
+        while marker not in output and time.time() < deadline:
+            if select.select([fd], [], [], 0.1)[0]:
+                try:
+                    output += os.read(fd, 65536)
+                except OSError:
+                    break
+        return marker in output
+
+    assert read_until(b"Enter confirms", 20), output
+    time.sleep(0.2)
+    os.write(fd, b"x\x1b[Bx\x1b[B\x1b[Bx\r")  # mark a, b and d, all in one burst
+    assert read_until(b"CHOSEN", 10), output
+    os.waitpid(pid, 0)
+    assert b"CHOSEN ['a', 'b', 'd']" in output

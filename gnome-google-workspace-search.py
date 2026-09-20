@@ -24,6 +24,7 @@ import argparse
 import base64
 import concurrent.futures
 import configparser
+import contextlib
 import email.utils
 import hashlib
 import http.server
@@ -901,6 +902,7 @@ class Service:
     object_name = ""    # D-Bus object path suffix, also the conf file suffix
     label = ""
     permission = ""     # shown in --setup before the user enables it
+    short = ""          # the same in a few words, for the checklist
     api = ""            # name of the API to enable in Google Cloud
     request_scopes = ()
     accepted_scopes = ()
@@ -947,6 +949,7 @@ class Service:
 
 class DriveService(Service):
     key, object_name, label = "drive", "Drive", "Google Drive"
+    short = "file names, owners and dates"
     permission = "file names, owners and dates (contents only if you ask for it)"
     api = "Google Drive API"
     home_url = "https://drive.google.com/"
@@ -983,6 +986,7 @@ class DriveService(Service):
 
 class GmailService(Service):
     key, object_name, label = "gmail", "Gmail", "Gmail"
+    short = "reads ALL your mail"
     permission = "read access to ALL your mail (Google has no narrower permission that can search)"
     api = "Gmail API"
     home_url = "https://mail.google.com/"
@@ -1047,6 +1051,7 @@ class GmailService(Service):
 
 class CalendarService(Service):
     key, object_name, label = "calendar", "Calendar", "Google Calendar"
+    short = "reads your events"
     permission = "read access to the events of your calendars"
     api = "Google Calendar API"
     home_url = "https://calendar.google.com/"
@@ -1105,6 +1110,7 @@ class CalendarService(Service):
 
 class ContactsService(Service):
     key, object_name, label = "contacts", "Contacts", "Google Contacts"
+    short = "reads contacts, people you wrote to, work directory"
     permission = ("read access to your contacts, the people you have exchanged mail with and, "
                   "on work accounts, your organization's directory")
     api = "People API"
@@ -1517,6 +1523,132 @@ def ask_yes_no(prompt, default=True):
     return answer in ("y", "yes", "s", "si", "sí")
 
 
+# -- checklist ------------------------------------------------------------------
+
+KEYS = {"\x1b[A": "up", "\x1b[B": "down", "\x1bOA": "up", "\x1bOB": "down", "k": "up", "j": "down",
+        " ": "toggle", "x": "toggle", "X": "toggle", "a": "all", "A": "all",
+        "\r": "done", "\n": "done"}
+
+
+def checklist_available():
+    """True on a real terminal that can be driven key by key."""
+    try:
+        import termios  # noqa: F401
+        return (os.isatty(sys.stdin.fileno()) and os.isatty(sys.stdout.fileno())
+                and os.environ.get("TERM", "dumb") != "dumb")
+    except (ImportError, OSError, ValueError, AttributeError):
+        return False
+
+
+@contextlib.contextmanager
+def key_mode():
+    """Deliver keys one by one for the duration of the block, then restore the terminal.
+
+    Entered once per checklist, not once per key: switching modes discards pending
+    input, which would drop keys while an arrow is held down.
+    """
+    try:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+    except (ImportError, OSError, ValueError, AttributeError):
+        yield  # not a terminal (tests, pipes): nothing to switch
+        return
+    try:
+        tty.setcbreak(fd, termios.TCSANOW)  # cbreak keeps Ctrl+C working, unlike raw mode
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, saved)
+
+
+def read_key():
+    """One key press, arrow keys included. Call inside key_mode()."""
+    import select
+
+    fd = sys.stdin.fileno()
+    key = os.read(fd, 1).decode(errors="ignore")
+    if key == "\x1b" and select.select([fd], [], [], 0.05)[0]:
+        # An escape sequence arrives at once; a lone Esc has nothing behind it.
+        key += os.read(fd, 2).decode(errors="ignore")
+    return key
+
+
+def checklist_lines(items, checked, cursor, width=80):
+    lines = []
+    pad = max(len(label) for _key, label, _note in items)
+    for index, (key, label, note) in enumerate(items):
+        mark = "x" if key in checked else " "
+        pointer = ">" if index == cursor else " "
+        lines.append(f"  {pointer} [{mark}] {label.ljust(pad)}  {note}"[:max(width - 1, 20)])
+    return lines
+
+
+def checklist(items, checked, keys=None, out=None, width=None):
+    """Pick any of items = [(key, label, note)]; returns the set of chosen keys.
+
+    Arrows or j/k move, space or x toggles, a toggles all, Enter confirms.
+    """
+    mode = contextlib.nullcontext() if keys else key_mode()
+    keys = keys or read_key
+    out = out or sys.stdout
+    width = width or shutil.get_terminal_size((80, 24)).columns
+    checked, cursor = set(checked), 0
+    out.write("  (arrows move, space or x marks, a marks all, Enter confirms)\n")
+    with mode:
+        return _checklist_loop(items, checked, cursor, keys, out, width)
+
+
+def _checklist_loop(items, checked, cursor, keys, out, width):
+    first = True
+    while True:
+        lines = checklist_lines(items, checked, cursor, width)
+        if not first:
+            out.write(f"\x1b[{len(lines)}A")  # back to the top of the list
+        first = False
+        for index, line in enumerate(lines):
+            style = "\x1b[1m" if index == cursor else ""
+            out.write(f"\r\x1b[2K{style}{line}\x1b[0m\n")
+        out.flush()
+        action = KEYS.get(keys())
+        if action == "up":
+            cursor = (cursor - 1) % len(items)
+        elif action == "down":
+            cursor = (cursor + 1) % len(items)
+        elif action == "toggle":
+            checked ^= {items[cursor][0]}
+        elif action == "all":
+            everything = {key for key, _label, _note in items}
+            checked = set() if checked == everything else everything
+        elif action == "done":
+            return checked
+
+
+def choose_services(cfg):
+    """Step 2 of the setup: which services to search."""
+    if checklist_available():
+        items = [(s.key, s.label, s.short) for s in SERVICES]
+        current = {k for k, enabled in cfg["services"].items() if enabled}
+        chosen = checklist(items, current)
+        for service in SERVICES:
+            cfg["services"][service.key] = service.key in chosen
+        for service in enabled_services(cfg):
+            print(f"  {service.label}: needs {service.permission}.")
+    else:
+        # Plain question per service, for terminals that cannot be driven key by key.
+        for service in SERVICES:
+            print(f"  {service.label}: needs {service.permission}.")
+            cfg["services"][service.key] = ask_yes_no(
+                f"    Search {service.label}?", cfg["services"].get(service.key, False))
+    if cfg["services"]["drive"]:
+        fulltext = ask_yes_no("  Drive: also search inside file contents? Slower, and needs read "
+                              "access to your files instead of names only", cfg["mode"] == "fulltext")
+        cfg["mode"] = "fulltext" if fulltext else "name"
+    else:
+        cfg["mode"] = "name"
+
+
 def provider_registration(service=None):
     """Path of the .ini GNOME Shell will load for a service, or None if it cannot see it."""
     service = service or SERVICES_BY_KEY["drive"]
@@ -1700,15 +1832,7 @@ def _setup_steps(cfg, config_path):
               "  Run ./install.sh from the project directory and follow its last step.")
 
     print("\n2. Services (each one is its own section in the overview)")
-    for service in SERVICES:
-        print(f"  {service.label}: needs {service.permission}.")
-        cfg["services"][service.key] = ask_yes_no(
-            f"    Search {service.label}?", cfg["services"].get(service.key, False))
-        if service.key == "drive" and cfg["services"]["drive"]:
-            fulltext = ask_yes_no("    Also search inside file contents? Slower, and needs read "
-                                  "access to your files instead of names only",
-                                  cfg["mode"] == "fulltext")
-            cfg["mode"] = "fulltext" if fulltext else "name"
+    choose_services(cfg)
     if not enabled_services(cfg):
         print("  Nothing enabled, so there is nothing to search. Run --setup again to change it.")
         save_preferences(cfg, config_path)

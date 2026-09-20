@@ -82,8 +82,19 @@ A short conversation in the terminal, safe to run again whenever you want to
 change something. It never removes anything.
 
 1. **GNOME Shell integration**: confirms the Shell can see the providers.
-2. **Services**: choose what to search. Each service states the permission it
-   needs before you say yes.
+2. **Services**: a checklist of what to search, each entry with the permission
+   it needs. Arrows (or `j`/`k`) move, space or `x` marks, `a` marks all, Enter
+   confirms:
+
+   ```
+     > [x] Google Drive     file names, owners and dates
+       [ ] Gmail            reads ALL your mail
+       [x] Google Calendar  reads your events
+       [ ] Google Contacts  reads contacts, people you wrote to, work directory
+   ```
+
+   Terminals that cannot be driven key by key get one yes/no question per
+   service instead.
 3. **OAuth client**: if you have none, walks you through registering one,
    opening each Google Cloud page for you
    (see [Creating the OAuth client](#creating-the-oauth-client)).
