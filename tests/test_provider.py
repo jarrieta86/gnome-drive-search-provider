@@ -286,7 +286,7 @@ def test_unknown_method_returns_dbus_error(monkeypatch):
 def test_activate_result_opens_web_link(monkeypatch):
     sp = make_provider(monkeypatch, [])
     opened = []
-    monkeypatch.setattr(sp, "_open", lambda url: opened.append(url))
+    monkeypatch.setattr(sp, "_open", lambda url, email=None: opened.append(url))
     sp.files["1"] = {"id": "1", "webViewLink": "https://docs.google.com/d/1"}
     inv = FakeInvocation()
     sp.ActivateResult(GLib.Variant("(sasu)", ("1", ["x"], 0)), inv)
@@ -589,10 +589,10 @@ def test_accounts_merges_sources_skips_duplicates_and_remembers_disabled(tmp_pat
 
 def test_search_all_queries_every_account_and_tags_results(monkeypatch):
     sp = provider.SearchProvider(GLib.MainLoop(), dict(provider.DEFAULTS))
-    personal, work = make_account(["t"]), make_account(["t"])
-    personal.identity, work.identity = "me@gmail.com", "me@work.com"
-    broken = make_account(["t"])
-    broken.identity = "broken@x.com"
+    personal, work, broken = (
+        provider.Account(email, lambda: ("t", 3600))
+        for email in ("me@gmail.com", "me@work.com", "broken@x.com")
+    )
     sp._accounts, sp._accounts_at = [personal, work, broken], float("inf")
 
     def fake_search(account, terms, cfg, **kw):
@@ -610,7 +610,7 @@ def test_search_all_queries_every_account_and_tags_results(monkeypatch):
 def test_results_open_with_the_account_that_found_them(monkeypatch):
     sp = make_provider(monkeypatch, [])
     opened = []
-    monkeypatch.setattr(sp, "_open", lambda url: opened.append(url))
+    monkeypatch.setattr(sp, "_open", lambda url, email=None: opened.append(url))
     sp.files["1"] = {"id": "1", "webViewLink": "https://docs.google.com/d/1/edit?usp=drivesdk",
                      "_email": "me@work.com"}
     sp.ActivateResult(GLib.Variant("(sasu)", ("1", ["x"], 0)), FakeInvocation())
@@ -625,3 +625,157 @@ def test_multi_account_results_show_the_account(monkeypatch):
     f = {"id": "1", "name": "N", "mimeType": "application/pdf", "_account": "me@work.com"}
     assert sp.result_meta(f, True)["description"].get_string() == "PDF - me@work.com"
     assert sp.result_meta(f, False)["description"].get_string() == "PDF"
+
+
+# ---------------------------------------------------------------------------
+# Browser profiles
+# ---------------------------------------------------------------------------
+
+
+def write_local_state(home, relative=".config/google-chrome"):
+    config_dir = home / relative
+    config_dir.mkdir(parents=True)
+    (config_dir / "Local State").write_text(json.dumps({"profile": {"info_cache": {
+        "Default": {"name": "Work", "user_name": "Me@Work.com"},
+        "Profile 1": {"name": "Home", "user_name": "me@gmail.com"},
+        "Profile 2": {"name": "Guest-like", "user_name": ""},
+    }}}))
+    return config_dir
+
+
+def test_chromium_profiles_maps_signed_in_emails(tmp_path):
+    config_dir = write_local_state(tmp_path)
+    assert provider.chromium_profiles(str(config_dir)) == {
+        "me@work.com": "Default", "me@gmail.com": "Profile 1",
+    }
+    assert provider.chromium_profiles(str(tmp_path / "nope")) == {}
+    (config_dir / "Local State").write_text("not json")
+    assert provider.chromium_profiles(str(config_dir)) == {}
+
+
+def test_profile_command_for_chrome(tmp_path):
+    write_local_state(tmp_path)
+    argv = provider.profile_command(
+        "google-chrome.desktop", "/usr/bin/google-chrome-stable %U", "https://x/1",
+        "ME@gmail.com", home=str(tmp_path),
+    )
+    assert argv == ["/usr/bin/google-chrome-stable", "--profile-directory=Profile 1", "https://x/1"]
+
+
+def test_profile_command_for_flatpak_chrome_strips_forwarding_markers(tmp_path):
+    write_local_state(tmp_path, ".var/app/com.google.Chrome/config/google-chrome")
+    cmd = "/usr/bin/flatpak run --branch=stable --command=/app/bin/chrome com.google.Chrome @@u %U @@"
+    argv = provider.profile_command("com.google.Chrome.desktop", cmd, "https://x/1", "me@work.com",
+                                    home=str(tmp_path))
+    assert argv == ["/usr/bin/flatpak", "run", "--branch=stable", "--command=/app/bin/chrome",
+                    "com.google.Chrome", "--profile-directory=Default", "https://x/1"]
+
+
+def test_profile_command_falls_back_to_none(tmp_path):
+    write_local_state(tmp_path)
+    home = str(tmp_path)
+    chrome = ("google-chrome.desktop", "/usr/bin/google-chrome-stable %U", "https://x/1")
+    # Not a Chromium browser, unknown account, no account, no Local State.
+    assert provider.profile_command("firefox.desktop", "firefox %u", "https://x/1", "me@work.com",
+                                    home=home) is None
+    assert provider.profile_command(*chrome, "stranger@x.com", home=home) is None
+    assert provider.profile_command(*chrome, None, home=home) is None
+    assert provider.profile_command(*chrome, "me@work.com", home=str(tmp_path / "empty")) is None
+
+
+def test_profile_command_manual_override_wins(tmp_path):
+    write_local_state(tmp_path)
+    argv = provider.profile_command(
+        "google-chrome.desktop", "/usr/bin/google-chrome-stable %U", "https://x/1", "me@work.com",
+        overrides={"me@work.com": "Profile 7"}, home=str(tmp_path),
+    )
+    assert "--profile-directory=Profile 7" in argv
+
+
+class FakeApp:
+    def __init__(self, app_id, commandline):
+        self._id, self._cmd = app_id, commandline
+
+    def get_id(self):
+        return self._id
+
+    def get_commandline(self):
+        return self._cmd
+
+
+def patch_launchers(monkeypatch, app, popen_error=None):
+    launched = {"popen": [], "default": []}
+
+    def popen(argv, **kw):
+        if popen_error:
+            raise popen_error
+        launched["popen"].append(argv)
+
+    monkeypatch.setattr(provider.Gio.AppInfo, "get_default_for_uri_scheme", lambda scheme: app)
+    monkeypatch.setattr(provider.subprocess, "Popen", popen)
+    monkeypatch.setattr(provider.Gio.AppInfo, "launch_default_for_uri",
+                        lambda url, ctx: launched["default"].append(url))
+    return launched
+
+
+def test_open_url_uses_the_profile_of_the_account(tmp_path, monkeypatch):
+    write_local_state(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    launched = patch_launchers(monkeypatch, FakeApp("google-chrome.desktop", "/opt/chrome %U"))
+    provider.open_url("https://x/1", "me@gmail.com", dict(provider.DEFAULTS))
+    assert launched == {"popen": [["/opt/chrome", "--profile-directory=Profile 1", "https://x/1"]],
+                        "default": []}
+
+
+def test_open_url_falls_back_to_the_default_handler(tmp_path, monkeypatch):
+    write_local_state(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    chrome = FakeApp("google-chrome.desktop", "/opt/chrome %U")
+    cases = [
+        (FakeApp("firefox.desktop", "firefox %u"), "me@gmail.com", dict(provider.DEFAULTS), None),
+        (chrome, None, dict(provider.DEFAULTS), None),
+        (chrome, "me@gmail.com", dict(provider.DEFAULTS, use_profiles=False), None),
+        (chrome, "me@gmail.com", dict(provider.DEFAULTS), OSError("chrome is gone")),
+        (None, "me@gmail.com", dict(provider.DEFAULTS), None),
+    ]
+    for app, email, cfg, error in cases:
+        launched = patch_launchers(monkeypatch, app, popen_error=error)
+        provider.open_url("https://x/1", email, cfg)
+        assert launched == {"popen": [], "default": ["https://x/1"]}
+
+
+def test_load_config_reads_browser_profile_overrides(tmp_path, monkeypatch):
+    monkeypatch.delenv("GNOME_DRIVE_SEARCH_TOKEN_FILE", raising=False)
+    ini = tmp_path / "config.ini"
+    ini.write_text("[browser]\nuse_profiles = no\n[browser_profiles]\nMe@Work.com = Profile 3\n")
+    cfg = provider.load_config(str(ini))
+    assert cfg["use_profiles"] is False
+    assert cfg["profiles"] == {"me@work.com": "Profile 3"}
+    assert provider.load_config(str(tmp_path / "none.ini"))["use_profiles"] is True
+
+
+def test_token_file_accounts_resolve_their_email_once(monkeypatch):
+    calls = []
+
+    def fake_fetch(token):
+        calls.append(token)
+        return "me@work.com"
+
+    monkeypatch.setattr(provider, "fetch_email", fake_fetch)
+    account = provider.Account("google_token.json", lambda: ("t", 3600), source="token_file")
+    assert account.email is None
+    assert account.resolve_email() == "me@work.com"
+    assert account.resolve_email() == "me@work.com"
+    assert calls == ["t"]
+    # Accounts named after their email never need the extra request.
+    assert provider.Account("a@b.c", lambda: ("t", 3600)).resolve_email() == "a@b.c"
+    assert calls == ["t"]
+
+
+def test_activate_result_passes_the_account_to_the_opener(monkeypatch):
+    sp = make_provider(monkeypatch, [])
+    seen = []
+    monkeypatch.setattr(provider, "open_url", lambda url, email, cfg: seen.append((url, email)))
+    sp.files["1"] = {"id": "1", "webViewLink": "https://d/1", "_email": "me@work.com"}
+    sp.ActivateResult(GLib.Variant("(sasu)", ("1", ["x"], 0)), FakeInvocation())
+    assert seen == [("https://d/1?authuser=me%40work.com", "me@work.com")]
