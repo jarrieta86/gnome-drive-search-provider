@@ -4,8 +4,9 @@
 One D-Bus service exports a search provider (org.gnome.Shell.SearchProvider2)
 per Google service: Drive, Gmail, Calendar and Contacts. Each one shows up as its
 own section in the Activities overview and can be switched on and off, both here
-(``--setup``) and in Settings > Search. Only Drive is enabled by default, and an
-account is only ever asked for the permissions of the services you enable.
+(``--setup``) and in Settings > Search. Drive and Contacts are enabled by default,
+Gmail and Calendar are not, and an account is only ever asked for the permissions
+of the services you enable.
 
 Accounts are added with ``--setup`` or ``--login``, which run the OAuth flow in
 your browser using your own OAuth client and store one token file per account
@@ -135,7 +136,7 @@ DEFAULTS = {
     "shared_drives": True,
     "idle_exit_seconds": 300,
     "token_file": "",
-    "services": {"drive": True, "gmail": False, "calendar": False, "contacts": False},
+    "services": {"drive": True, "gmail": False, "calendar": False, "contacts": True},
     "use_profiles": True,
     "profiles": {},  # manual overrides: account email -> browser profile directory
 }
@@ -1825,7 +1826,8 @@ def _setup_steps(cfg, config_path):
     print("1. GNOME Shell integration")
     registered = {s.key: provider_registration(s) for s in SERVICES}
     if all(registered.values()):
-        print(f"  Registered in {os.path.dirname(registered['drive'])}")
+        print("  OK: GNOME Shell can see the search sections, nothing to do here.")
+        print(f"  (their definitions are installed in {os.path.dirname(registered['drive'])})")
     else:
         missing = ", ".join(s.label for s in SERVICES if not registered[s.key])
         print(f"  Not registered: GNOME Shell cannot see {missing} yet.\n"

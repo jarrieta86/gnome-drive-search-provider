@@ -8,7 +8,7 @@
 drive = true
 gmail = false
 calendar = false
-contacts = false
+contacts = true
 
 [search]
 # name: match file names. fulltext: also match file contents (slower, no sorting by

@@ -23,9 +23,9 @@ Activities  >  "budget"
     Ann Lee                      ann@work.com - CFO, Acme - me@work.com
 ```
 
-Only Google Drive is searched out of the box. Every other service is off until
-you switch it on, and an account is only ever asked for the permissions of the
-services you enabled.
+Google Drive and Google Contacts are searched out of the box. Gmail and Google
+Calendar stay off until you switch them on, and an account is only ever asked
+for the permissions of the services you enabled.
 
 > Formerly `gnome-drive-search-provider`. Installing this version replaces the
 > old one and keeps your accounts and settings.
@@ -110,7 +110,7 @@ change something. It never removes anything.
 | Google Drive | on | `drive.metadata.readonly` | File names, owners, dates. Never contents, unless you opt in to content search (`drive.readonly`) |
 | Gmail | off | `gmail.readonly` | **All your mail.** Google has a metadata-only permission, but it cannot search |
 | Google Calendar | off | `calendar.events.readonly` | Events of your primary calendar |
-| Google Contacts | off | `contacts.readonly`, `contacts.other.readonly`, `directory.readonly` | Your contacts, the people you have exchanged mail with and, on work accounts, your organization's directory |
+| Google Contacts | on | `contacts.readonly`, `contacts.other.readonly`, `directory.readonly` | Your contacts, the people you have exchanged mail with and, on work accounts, your organization's directory |
 
 All access is read-only. Tokens are stored one file per account in
 `~/.config/gnome-google-workspace-search/accounts/`, readable only by you. Think
@@ -243,7 +243,7 @@ default. The most useful ones:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `services.drive`, `.gmail`, `.calendar`, `.contacts` | `true`, then `false` | Which services are searched |
+| `services.drive`, `.gmail`, `.calendar`, `.contacts` | `true`, `false`, `false`, `true` | Which services are searched |
 | `search.mode` | `name` | Drive only. `name` matches file names; `fulltext` also matches contents (slower, unsorted, needs read access) |
 | `search.max_results` | `10` | Results per service |
 | `search.min_chars` | `3` | Shorter queries are ignored |

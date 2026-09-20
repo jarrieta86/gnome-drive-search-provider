@@ -800,7 +800,7 @@ def test_activate_result_passes_the_account_to_the_opener(monkeypatch):
 
 # Answers to step 2 of --setup without a key-driven terminal:
 # Drive?, Gmail?, Calendar?, Contacts?, then Drive contents?
-DRIVE_ONLY = ["", "", "", "", ""]
+DRIVE_ONLY = ["", "", "", "n", ""]   # Contacts is on by default, so say no
 
 
 def setup_env(tmp_path, monkeypatch, answers, registered=True):
@@ -902,7 +902,7 @@ def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path,
     assert oct(stored.stat().st_mode & 0o777) == "0o600"
     assert provider.load_client_secret(str(stored))["project"] == "proj-555"
     out = capsys.readouterr().out
-    assert "Registered in /usr/share/p" in out
+    assert "OK: GNOME Shell can see the search sections" in out and "/usr/share/p)" in out
     assert "Audience: External" in out and "Publish app" in out and "Desktop app" in out
     assert "Google Drive: 2 result(s)" in out
     assert "Gmail:" not in out.split("5. Test")[1]  # disabled services are not searched
@@ -953,7 +953,7 @@ def test_setup_enabling_gmail_reauthorizes_existing_accounts(tmp_path, monkeypat
     cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
     connect(cfg_dir, "me@work.com")
     (cfg_dir / "config.ini").write_text("[search]\nmax_results = 4\n")
-    answers = ["", "y", "", "", "",   # Drive yes, Gmail YES, Calendar no, Contacts no, names only
+    answers = ["", "y", "", "n", "",  # Drive yes, Gmail YES, Calendar no, Contacts no, names only
                "",                    # authorize Gmail for me@work.com now? default yes
                "", ""]                # add another? no / skip the test
     _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
@@ -973,7 +973,7 @@ def test_setup_enabling_gmail_reauthorizes_existing_accounts(tmp_path, monkeypat
 def test_setup_fulltext_is_saved_and_asks_for_read_access(tmp_path, monkeypatch):
     cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
     connect(cfg_dir, "old@work.com")
-    answers = ["", "", "", "", "y",   # Drive only, contents YES
+    answers = ["", "", "", "n", "y",  # Drive only, contents YES
                "n",                   # authorize now? no
                "", ""]
     _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
@@ -983,7 +983,7 @@ def test_setup_fulltext_is_saved_and_asks_for_read_access(tmp_path, monkeypatch)
 
 
 def test_setup_with_nothing_enabled_stops(tmp_path, monkeypatch, capsys):
-    _, _, queue, logins = setup_env(tmp_path, monkeypatch, ["n", "", "", ""])
+    _, _, queue, logins = setup_env(tmp_path, monkeypatch, ["n", "", "", "n"])
     assert run_setup_with_config() == 1
     assert queue == [] and logins == []
     assert "Nothing enabled" in capsys.readouterr().out
@@ -1076,10 +1076,11 @@ def http_error(code, body):
     return urllib.error.HTTPError("https://x", code, "err", {}, io.BytesIO(body.encode()))
 
 
-def test_only_drive_is_enabled_by_default_and_config_can_change_it(tmp_path):
-    assert [s.key for s in provider.enabled_services(provider.load_config(str(tmp_path / "x")))] == ["drive"]
+def test_drive_and_contacts_are_enabled_by_default_and_config_can_change_it(tmp_path):
+    defaults = provider.enabled_services(provider.load_config(str(tmp_path / "x")))
+    assert [s.key for s in defaults] == ["drive", "contacts"]
     ini = tmp_path / "config.ini"
-    ini.write_text("[services]\ndrive = no\ngmail = yes\n")
+    ini.write_text("[services]\ndrive = no\ngmail = yes\ncontacts = no\n")
     cfg = provider.load_config(str(ini))
     assert [s.key for s in provider.enabled_services(cfg)] == ["gmail"]
     assert provider.DEFAULTS["services"]["gmail"] is False  # defaults are not mutated
@@ -1087,7 +1088,10 @@ def test_only_drive_is_enabled_by_default_and_config_can_change_it(tmp_path):
 
 def test_login_scopes_cover_exactly_the_enabled_services():
     cfg = dict(provider.DEFAULTS)
-    assert provider.login_scopes(cfg) == [provider.SCOPE_EMAIL, provider.SCOPE_METADATA]
+    assert provider.login_scopes(cfg) == [
+        provider.SCOPE_EMAIL, provider.SCOPE_METADATA, provider.SCOPE_CONTACTS,
+        provider.SCOPE_OTHER_CONTACTS, provider.SCOPE_DIRECTORY,
+    ]
     cfg = all_on()
     cfg["mode"] = "fulltext"
     assert provider.login_scopes(cfg) == [
@@ -1310,7 +1314,8 @@ def test_accounts_listing_says_what_each_account_can_search(tmp_path, monkeypatc
     cfg["services"]["gmail"] = True
     assert provider.run_accounts(cfg) == 0
     out = capsys.readouterr().out
-    assert "a@x.com  (--login)  searches: Google Drive\n    not authorized for: Gmail" in out
+    assert ("a@x.com  (--login)  searches: Google Drive\n"
+            "    not authorized for: Gmail, Google Contacts") in out
     assert "b@x.com  (--login)  searches: Google Drive, Gmail\n" in out
 
 
@@ -1477,20 +1482,21 @@ def test_checklist_is_not_used_without_a_real_terminal(monkeypatch):
 
 def test_setup_picks_services_from_the_checklist_when_the_terminal_allows(tmp_path, monkeypatch, capsys):
     cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
-    connect(cfg_dir, "me@work.com", provider.SCOPE_METADATA, provider.SCOPE_GMAIL)
+    connect(cfg_dir, "me@work.com", provider.SCOPE_METADATA, provider.SCOPE_GMAIL, provider.SCOPE_CONTACTS)
     _, prompts, queue, _ = setup_env(tmp_path, monkeypatch, ["", "", ""])
     #                        Drive contents? no / add another account? no / skip the test
     monkeypatch.setattr(provider, "checklist_available", lambda: True)
     monkeypatch.setattr(provider, "read_key", iter([DOWN, " ", "\r"]).__next__)   # mark Gmail
     monkeypatch.setattr(provider.GmailService, "search", lambda self, account, terms, cfg: [])
+    monkeypatch.setattr(provider.ContactsService, "search", lambda self, account, terms, cfg: [])
 
     assert run_setup_with_config() == 0
     assert queue == []
     assert not any("Search Gmail?" in p for p in prompts)      # no question per service
     saved = provider.load_config(provider.CONFIG_PATH)["services"]
-    assert saved == {"drive": True, "gmail": True, "calendar": False, "contacts": False}
+    assert saved == {"drive": True, "gmail": True, "calendar": False, "contacts": True}
     out = capsys.readouterr().out
-    assert "[x] Gmail" in out and "reads ALL your mail" in out
+    assert "[x] Gmail" in out and "[x] Google Contacts" in out and "reads ALL your mail" in out
     assert "Gmail: needs read access to ALL your mail" in out  # full wording once chosen
     assert "Google Calendar: needs" not in out
 
