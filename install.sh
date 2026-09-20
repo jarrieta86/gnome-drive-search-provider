@@ -74,7 +74,7 @@ Next: choose what to search and connect your Google accounts with the guided set
 
   $LIBEXECDIR/$BIN --setup
 
-Only Google Drive is searched until you enable more there. Then open the
+Google Drive and Contacts are searched unless you change it there. Then open the
 Activities overview and type. GNOME Shell picks the providers up right away; if
 a section does not appear, check Settings > Search, or log out and back in.
 MSG

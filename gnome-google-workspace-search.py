@@ -2,10 +2,11 @@
 """GNOME Shell search providers for Google Workspace.
 
 One D-Bus service exports a search provider (org.gnome.Shell.SearchProvider2)
-per Google service: Drive, Gmail, Calendar and Contacts. Each one shows up as its
+per Google service: Drive, Contacts, Gmail and Calendar. Each one shows up as its
 own section in the Activities overview and can be switched on and off, both here
-(``--setup``) and in Settings > Search. Only Drive is enabled by default, and an
-account is only ever asked for the permissions of the services you enable.
+(``--setup``) and in Settings > Search. Drive and Contacts are enabled by default,
+Gmail and Calendar are not, and an account is only ever asked for the permissions
+of the services you enable.
 
 Accounts are added with ``--setup`` or ``--login``, which run the OAuth flow in
 your browser using your own OAuth client and store one token file per account
@@ -135,7 +136,7 @@ DEFAULTS = {
     "shared_drives": True,
     "idle_exit_seconds": 300,
     "token_file": "",
-    "services": {"drive": True, "gmail": False, "calendar": False, "contacts": False},
+    "services": {"drive": True, "contacts": True, "gmail": False, "calendar": False},
     "use_profiles": True,
     "profiles": {},  # manual overrides: account email -> browser profile directory
 }
@@ -903,6 +904,7 @@ class Service:
     label = ""
     permission = ""     # shown in --setup before the user enables it
     short = ""          # the same in a few words, for the checklist
+    detail = ""         # a sentence or two shown under the checklist for the highlighted row
     api = ""            # name of the API to enable in Google Cloud
     request_scopes = ()
     accepted_scopes = ()
@@ -950,6 +952,8 @@ class Service:
 class DriveService(Service):
     key, object_name, label = "drive", "Drive", "Google Drive"
     short = "file names, owners and dates"
+    detail = ("Sees the names, owners and dates of your files, never what is inside them. "
+              "Searching inside files is a separate question, next.")
     permission = "file names, owners and dates (contents only if you ask for it)"
     api = "Google Drive API"
     home_url = "https://drive.google.com/"
@@ -986,7 +990,9 @@ class DriveService(Service):
 
 class GmailService(Service):
     key, object_name, label = "gmail", "Gmail", "Gmail"
-    short = "reads ALL your mail"
+    short = "needs to read all your mail"
+    detail = ("Google has no permission to search mail without being able to read it, so "
+              "this covers all your mail. Read-only; nothing is stored.")
     permission = "read access to ALL your mail (Google has no narrower permission that can search)"
     api = "Gmail API"
     home_url = "https://mail.google.com/"
@@ -1052,6 +1058,7 @@ class GmailService(Service):
 class CalendarService(Service):
     key, object_name, label = "calendar", "Calendar", "Google Calendar"
     short = "reads your events"
+    detail = "Sees the events of your main calendar: titles, times and places. Read-only."
     permission = "read access to the events of your calendars"
     api = "Google Calendar API"
     home_url = "https://calendar.google.com/"
@@ -1111,6 +1118,8 @@ class CalendarService(Service):
 class ContactsService(Service):
     key, object_name, label = "contacts", "Contacts", "Google Contacts"
     short = "reads contacts, people you wrote to, work directory"
+    detail = ("Sees your saved contacts, the people you have exchanged mail with and, on work "
+              "accounts, the company directory. Read-only.")
     permission = ("read access to your contacts, the people you have exchanged mail with and, "
                   "on work accounts, your organization's directory")
     api = "People API"
@@ -1202,7 +1211,8 @@ class ContactsService(Service):
         return "https://contacts.google.com/search/" + urllib.parse.quote(" ".join(terms))
 
 
-SERVICES = [DriveService(), GmailService(), CalendarService(), ContactsService()]
+# In the order they are listed to the user: the ones enabled by default first.
+SERVICES = [DriveService(), ContactsService(), GmailService(), CalendarService()]
 SERVICES_BY_KEY = {service.key: service for service in SERVICES}
 
 
@@ -1585,10 +1595,27 @@ def checklist_lines(items, checked, cursor, width=80):
     return lines
 
 
-def checklist(items, checked, keys=None, out=None, width=None):
+DETAIL_LINES = 2
+
+
+def detail_lines(text, width=80):
+    """The explanation of the highlighted row, always DETAIL_LINES long so it redraws in place."""
+    import textwrap
+
+    room = max(width - 5, 20)
+    wrapped = textwrap.wrap(text, room)
+    if len(wrapped) > DETAIL_LINES:
+        wrapped = wrapped[:DETAIL_LINES]
+        wrapped[-1] = wrapped[-1][:room - 3].rstrip() + "..."
+    wrapped += [""] * (DETAIL_LINES - len(wrapped))
+    return ["    " + line for line in wrapped]
+
+
+def checklist(items, checked, keys=None, out=None, width=None, details=None):
     """Pick any of items = [(key, label, note)]; returns the set of chosen keys.
 
     Arrows or j/k move, space or x toggles, a toggles all, Enter confirms.
+    details maps a key to a sentence shown under the list while that row is highlighted.
     """
     mode = contextlib.nullcontext() if keys else key_mode()
     keys = keys or read_key
@@ -1597,19 +1624,22 @@ def checklist(items, checked, keys=None, out=None, width=None):
     checked, cursor = set(checked), 0
     out.write("  (arrows move, space or x marks, a marks all, Enter confirms)\n")
     with mode:
-        return _checklist_loop(items, checked, cursor, keys, out, width)
+        return _checklist_loop(items, checked, cursor, keys, out, width, details)
 
 
-def _checklist_loop(items, checked, cursor, keys, out, width):
+def _checklist_loop(items, checked, cursor, keys, out, width, details=None):
     first = True
     while True:
         lines = checklist_lines(items, checked, cursor, width)
+        extra = [""] + detail_lines(details.get(items[cursor][0], ""), width) if details else []
         if not first:
-            out.write(f"\x1b[{len(lines)}A")  # back to the top of the list
+            out.write(f"\x1b[{len(lines) + len(extra)}A")  # back to the top of the list
         first = False
         for index, line in enumerate(lines):
             style = "\x1b[1m" if index == cursor else ""
             out.write(f"\r\x1b[2K{style}{line}\x1b[0m\n")
+        for line in extra:
+            out.write(f"\r\x1b[2K\x1b[2m{line}\x1b[0m\n")  # dimmed
         out.flush()
         action = KEYS.get(keys())
         if action == "up":
@@ -1630,11 +1660,10 @@ def choose_services(cfg):
     if checklist_available():
         items = [(s.key, s.label, s.short) for s in SERVICES]
         current = {k for k, enabled in cfg["services"].items() if enabled}
-        chosen = checklist(items, current)
+        chosen = checklist(items, current, details={s.key: s.detail for s in SERVICES})
         for service in SERVICES:
             cfg["services"][service.key] = service.key in chosen
-        for service in enabled_services(cfg):
-            print(f"  {service.label}: needs {service.permission}.")
+        print("  Selected: " + (", ".join(s.label for s in enabled_services(cfg)) or "nothing") + ".")
     else:
         # Plain question per service, for terminals that cannot be driven key by key.
         for service in SERVICES:
@@ -1825,7 +1854,8 @@ def _setup_steps(cfg, config_path):
     print("1. GNOME Shell integration")
     registered = {s.key: provider_registration(s) for s in SERVICES}
     if all(registered.values()):
-        print(f"  Registered in {os.path.dirname(registered['drive'])}")
+        print("  OK: GNOME Shell can see the search sections, nothing to do here.")
+        print(f"  (their definitions are installed in {os.path.dirname(registered['drive'])})")
     else:
         missing = ", ".join(s.label for s in SERVICES if not registered[s.key])
         print(f"  Not registered: GNOME Shell cannot see {missing} yet.\n"
