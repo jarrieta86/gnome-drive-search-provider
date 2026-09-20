@@ -37,7 +37,8 @@ cd gnome-drive-search-provider
 sudo ./install.sh --system    # or: every user, under /usr/local
 ```
 
-Next, [connect your Google accounts](#connect-your-google-accounts). Then open the
+Accept the installer's offer to run the guided setup, or see
+[Connect your Google accounts](#connect-your-google-accounts). Then open the
 Activities overview and type. GNOME Shell reloads its providers
 when the desktop file is installed, so no restart is needed. If the **Google
 Drive** section does not appear, check that it is enabled in **Settings >
@@ -81,12 +82,24 @@ Queries shorter than 3 characters are ignored to avoid hammering the API.
 ## Connect your Google accounts
 
 ```sh
-gnome-drive-search-provider --login --client-secret ~/Downloads/client_secret.json
+gnome-drive-search-provider --setup
 ```
 
-Your browser opens on Google's consent screen; approve it and the account is
-connected. The provider only asks for `drive.metadata.readonly`: it can see file
-names, owners and dates, never file contents.
+The guided setup checks that GNOME Shell can see the provider, helps you store
+your OAuth client, connects as many Google accounts as you want (one browser
+login each), and ends with a test search. `./install.sh` offers to run it for
+you. Run it again any time to add accounts or change what is searched; it never
+removes anything.
+
+By default the provider only asks Google for `drive.metadata.readonly`: it can
+see file names, owners and dates, never file contents. Searching inside files is
+an explicit choice in the setup and requests read access instead.
+
+The same steps are available one by one, for scripts or if you prefer:
+
+```sh
+gnome-drive-search-provider --login --client-secret ~/Downloads/client_secret.json
+```
 
 **Several accounts.** Run `--login` once per account (the client secret is only
 needed the first time; it is remembered). All accounts are searched at the same
@@ -204,7 +217,7 @@ Start the service by hand with `gnome-drive-search-provider --verbose` to see
 every request.
 
 No results: check `gnome-drive-search-provider --accounts`. An empty list means
-you still have to `--login`. If an account is listed but the log says its token
+you still have to run `--setup`. If an account is listed but the log says its token
 "lacks the Drive permission", log in to it again (with `--fulltext` if you use
 `mode = fulltext`). If searches stop working after a week, your OAuth app is
 still in *Testing*; publish it (see above) and log in once more.

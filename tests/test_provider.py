@@ -583,7 +583,7 @@ def test_accounts_merges_sources_skips_duplicates_and_remembers_disabled(tmp_pat
         ("me@gmail.com", "login"), ("me@work.com", "login"), ("other@old.com", "goa"),
     ]
     found[2].disabled = True
-    sp._accounts_at = 0  # force a re-read, as happens every minute
+    sp.invalidate_accounts()  # force a re-read, as happens every minute
     assert [a.identity for a in sp.accounts()] == ["me@gmail.com", "me@work.com"]
 
 
@@ -779,3 +779,163 @@ def test_activate_result_passes_the_account_to_the_opener(monkeypatch):
     sp.files["1"] = {"id": "1", "webViewLink": "https://d/1", "_email": "me@work.com"}
     sp.ActivateResult(GLib.Variant("(sasu)", ("1", ["x"], 0)), FakeInvocation())
     assert seen == [("https://d/1?authuser=me%40work.com", "me@work.com")]
+
+
+# ---------------------------------------------------------------------------
+# Guided setup
+# ---------------------------------------------------------------------------
+
+
+def setup_env(tmp_path, monkeypatch, answers, registered=True):
+    """Isolated config dir, scripted answers, a fake login and a fake Drive."""
+    cfg_dir = tmp_path / "cfg"
+    monkeypatch.setattr(provider, "CONFIG_DIR", str(cfg_dir))
+    monkeypatch.setattr(provider, "CONFIG_PATH", str(cfg_dir / "config.ini"))
+    monkeypatch.setattr(provider, "ACCOUNTS_DIR", str(cfg_dir / "accounts"))
+    monkeypatch.setattr(provider, "CLIENT_SECRET_PATH", str(cfg_dir / "client_secret.json"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(provider.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(provider, "goa_accounts", lambda: [])
+    monkeypatch.setattr(provider, "provider_registration",
+                        lambda: "/usr/share/x.ini" if registered else None)
+    prompts, queue = [], list(answers)
+
+    def fake_input(prompt):
+        prompts.append(prompt)
+        if not queue:
+            raise AssertionError(f"unexpected prompt: {prompt}")
+        return queue.pop(0)
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    logins = []
+    emails = iter(["me@gmail.com", "me@work.com"])
+
+    def fake_login(client_secret=None, fulltext=False, **kw):
+        email = next(emails)
+        logins.append((email, fulltext))
+        client = provider.load_client_secret(provider.CLIENT_SECRET_PATH)
+        payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+        scope = provider.SCOPE_READONLY if fulltext else provider.SCOPE_METADATA
+        provider.save_account(email, client, payload, scope)
+        return email
+
+    monkeypatch.setattr(provider, "login", fake_login)
+    monkeypatch.setattr(provider, "drive_search", lambda account, terms, cfg, **kw: [
+        {"id": account.identity, "name": f"Budget of {account.identity}", "mimeType": "application/pdf",
+         "modifiedTime": "2026-01-01T00:00:00Z"}])
+    return cfg_dir, prompts, queue, logins
+
+
+def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path, monkeypatch, capsys):
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    secret = write_client_secret(downloads)
+    answers = [
+        "",          # search contents? default no
+        "",          # client path: accept the one found in ~/Downloads
+        "",          # add an account? default yes
+        "y",         # add another?
+        "",          # add another? default no
+        "budget",    # test search
+    ]
+    cfg_dir, prompts, queue, logins = setup_env(tmp_path, monkeypatch, answers)
+    cfg = provider.load_config(provider.CONFIG_PATH)
+
+    assert provider.run_setup(cfg, provider.CONFIG_PATH) == 0
+    assert queue == []
+    assert str(secret) in prompts[1]  # the downloaded client was offered as default
+    assert logins == [("me@gmail.com", False), ("me@work.com", False)]
+    assert oct((cfg_dir / "client_secret.json").stat().st_mode & 0o777) == "0o600"
+    out = capsys.readouterr().out
+    assert "Registered: /usr/share/x.ini" in out
+    assert "Budget of me@gmail.com" in out and "Budget of me@work.com" in out
+    assert "2 result(s)." in out
+
+
+def test_setup_is_rerunnable_and_offers_nothing_destructive(tmp_path, monkeypatch, capsys):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    cfg_dir.mkdir()
+    secret = write_client_secret(cfg_dir)
+    client = provider.load_client_secret(str(secret))
+    payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+    provider.save_account("me@work.com", client, payload, provider.SCOPE_METADATA)
+    _, prompts, queue, logins = setup_env(tmp_path, monkeypatch, ["", "", ""])
+    #                                    contents? no / add another? no / skip test
+
+    assert provider.run_setup(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 0
+    assert queue == [] and logins == []
+    out = capsys.readouterr().out
+    assert "OAuth client: ready" in out
+    assert "- me@work.com" in out
+    assert "Add another account?" in prompts[1]
+
+
+def test_setup_fulltext_is_saved_and_flags_accounts_with_names_only_access(tmp_path, monkeypatch, capsys):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    cfg_dir.mkdir()
+    client = provider.load_client_secret(str(write_client_secret(cfg_dir)))
+    payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+    provider.save_account("old@work.com", client, payload, provider.SCOPE_METADATA)
+    (cfg_dir / "config.ini").write_text("[search]\nmax_results = 4\n")
+    _, _, queue, logins = setup_env(tmp_path, monkeypatch, ["y", "y", "", ""])
+    #                               contents? yes / add another? yes / another? no / skip test
+
+    assert provider.run_setup(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 0
+    assert logins == [("me@gmail.com", True)]
+    saved = provider.load_config(provider.CONFIG_PATH)
+    assert saved["mode"] == "fulltext" and saved["max_results"] == 4  # other keys survive
+    assert "log in to them again to search contents: old@work.com" in capsys.readouterr().out
+
+
+def test_setup_without_a_client_stops_before_login(tmp_path, monkeypatch, capsys):
+    _, _, queue, logins = setup_env(tmp_path, monkeypatch, ["", "/nope.json", ""], registered=False)
+    #                               contents? no / bad path / give up
+    assert provider.run_setup(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 1
+    assert queue == [] and logins == []
+    out = capsys.readouterr().out
+    assert "Not registered" in out
+    assert "no OAuth client found at /nope.json" in out
+    assert "No usable account" in out
+
+
+def test_setup_refuses_to_run_without_a_terminal(monkeypatch, capsys):
+    monkeypatch.setattr(provider.sys.stdin, "isatty", lambda: False, raising=False)
+    assert provider.run_setup(dict(provider.DEFAULTS)) == 1
+    assert "interactive" in capsys.readouterr().err
+
+
+def test_setup_survives_ctrl_c(tmp_path, monkeypatch, capsys):
+    setup_env(tmp_path, monkeypatch, [])
+
+    def interrupt(prompt):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupt)
+    assert provider.run_setup(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 130
+    assert "Run it again any time" in capsys.readouterr().out
+
+
+def test_describe_account_mentions_the_browser_profile(tmp_path, monkeypatch):
+    write_local_state(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    patch_launchers(monkeypatch, FakeApp("google-chrome.desktop", "/opt/chrome %U"))
+    account = provider.Account("me@gmail.com", lambda: ("t", 3600))
+    assert provider.describe_account(account, dict(provider.DEFAULTS)) == (
+        "me@gmail.com  (opens in browser profile 'Profile 1')")
+    legacy = provider.Account("token.json", lambda: ("t", 3600), source="token_file")
+    assert provider.describe_account(legacy, dict(provider.DEFAULTS)) == "token.json  [token_file]"
+
+
+def test_invalidate_accounts_rereads_even_right_after_boot(tmp_path, monkeypatch):
+    # time.monotonic() starts near zero at boot; a forced refresh must not depend on it.
+    monkeypatch.setattr(provider.time, "monotonic", lambda: 5.0)
+    monkeypatch.setattr(provider, "ACCOUNTS_DIR", str(tmp_path / "accounts"))
+    monkeypatch.setattr(provider, "goa_accounts", lambda: [])
+    sp = provider.SearchProvider(GLib.MainLoop(), dict(provider.DEFAULTS))
+    assert sp.accounts() == []
+    client = provider.load_client_secret(str(write_client_secret(tmp_path)))
+    payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+    provider.save_account("new@x.com", client, payload, provider.SCOPE_METADATA)
+    assert sp.accounts() == []  # still cached
+    sp.invalidate_accounts()
+    assert [a.identity for a in sp.accounts()] == ["new@x.com"]

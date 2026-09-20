@@ -818,6 +818,12 @@ class SearchProvider:
 
     # -- accounts -----------------------------------------------------------
 
+    def invalidate_accounts(self):
+        """Force the next accounts() call to re-read every source."""
+        # Not a timestamp trick: time.monotonic() counts from boot and can be
+        # smaller than the refresh interval on a machine that just started.
+        self._accounts = None
+
     def accounts(self):
         """Usable accounts. Re-read every minute so --login shows up without a restart."""
         if self._accounts is None or time.monotonic() - self._accounts_at > 60:
@@ -976,6 +982,212 @@ class SearchProvider:
 
 
 # ---------------------------------------------------------------------------
+# Guided setup
+# ---------------------------------------------------------------------------
+
+CLIENT_GUIDE = """\
+  You need an OAuth client of your own (free, about five minutes, only once):
+    1. https://console.cloud.google.com/ : create a project, then enable the
+       "Google Drive API" under APIs & Services > Library.
+    2. APIs & Services > OAuth consent screen: choose External (or Internal for a
+       Google Workspace organization), fill in the name, then press "Publish app".
+       Left in "Testing", Google expires your login every 7 days.
+    3. APIs & Services > Credentials > Create credentials > OAuth client ID,
+       type "Desktop app", and download the JSON file.
+  Full guide: https://github.com/jarrieta86/gnome-drive-search-provider#creating-the-oauth-client
+"""
+
+
+def ask(prompt, default=""):
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        raise KeyboardInterrupt from None
+    return answer or default
+
+
+def ask_yes_no(prompt, default=True):
+    answer = ask(f"{prompt} ({'Y/n' if default else 'y/N'})").lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes", "s", "si", "sí")
+
+
+def provider_registration():
+    """Path of the .ini GNOME Shell will load, or None when it cannot see the provider."""
+    for data_dir in GLib.get_system_data_dirs():
+        path = os.path.join(data_dir, "gnome-shell", "search-providers", APP_ID + ".ini")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def find_client_secret_candidates(home=None):
+    downloads = os.path.join(home or os.path.expanduser("~"), "Downloads")
+    try:
+        names = [n for n in os.listdir(downloads)
+                 if n.startswith("client_secret") and n.endswith(".json")]
+    except OSError:
+        return []
+    paths = [os.path.join(downloads, n) for n in names]
+    return sorted(paths, key=os.path.getmtime, reverse=True)
+
+
+def setup_client(store=None):
+    """Make sure a valid OAuth client is stored; returns False if the user gives up."""
+    store = store or CLIENT_SECRET_PATH
+    if os.path.exists(store):
+        try:
+            load_client_secret(store)
+            print(f"  OAuth client: ready ({store})")
+            return True
+        except LoginError as e:
+            print(f"  The stored OAuth client is unusable: {e}")
+    print(CLIENT_GUIDE)
+    candidates = find_client_secret_candidates()
+    while True:
+        path = ask("  Path to the downloaded client JSON (empty to stop)",
+                   candidates[0] if candidates else "")
+        if not path:
+            return False
+        path = os.path.expanduser(path)
+        try:
+            client = load_client_secret(path)
+        except LoginError as e:
+            print(f"  {e}")
+            candidates = []
+            continue
+        if client["kind"] == "web":
+            print("  Note: that is a 'Web application' client; a 'Desktop app' one is simpler.")
+        os.makedirs(os.path.dirname(store), exist_ok=True)
+        shutil.copyfile(path, store)
+        os.chmod(store, 0o600)
+        print(f"  OAuth client saved to {store}")
+        return True
+
+
+def save_search_mode(mode, path=None):
+    path = path or CONFIG_PATH
+    parser = configparser.ConfigParser()
+    parser.read(path)
+    if not parser.has_section("search"):
+        parser.add_section("search")
+    if parser["search"].get("mode", DEFAULTS["mode"]) == mode:
+        return
+    parser["search"]["mode"] = mode
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        parser.write(f)
+
+
+def describe_account(account, cfg):
+    text = f"{account.identity}"
+    email = account.email
+    if email and cfg.get("use_profiles", True):
+        try:
+            app = Gio.AppInfo.get_default_for_uri_scheme("https")
+            argv = app and profile_command(app.get_id(), app.get_commandline(), "", email,
+                                           cfg.get("profiles"))
+        except GLib.Error:
+            argv = None
+        if argv:
+            profile = argv[-2].split("=", 1)[1]
+            text += f"  (opens in browser profile '{profile}')"
+    if account.source != "login":
+        text += f"  [{account.source}]"
+    return text
+
+
+def run_setup(cfg, config_path=None):
+    """Interactive, re-runnable configuration: provider check, OAuth client, accounts, test."""
+    if not sys.stdin.isatty():
+        print("Error: --setup is interactive; run it in a terminal.", file=sys.stderr)
+        return 1
+    print("Google Drive search for GNOME: setup\n")
+    try:
+        return _setup_steps(cfg, config_path or CONFIG_PATH)
+    except KeyboardInterrupt:
+        print("\nSetup interrupted. Run it again any time with --setup.")
+        return 130
+
+
+def _setup_steps(cfg, config_path):
+    print("1. GNOME Shell integration")
+    registration = provider_registration()
+    if registration:
+        print(f"  Registered: {registration}")
+    else:
+        print("  Not registered: GNOME Shell cannot see the provider yet.\n"
+              "  Run ./install.sh from the project directory and follow its last step.")
+
+    print("\n2. What to search")
+    fulltext = ask_yes_no("  Also search inside file contents? Slower, and needs read access "
+                          "to your files instead of names only", cfg["mode"] == "fulltext")
+    cfg["mode"] = "fulltext" if fulltext else "name"
+    save_search_mode(cfg["mode"], config_path)
+
+    print("\n3. OAuth client")
+    have_client = setup_client()
+
+    print("\n4. Google accounts")
+    provider = SearchProvider(GLib.MainLoop(), cfg)
+    provider.accounts()
+    wanted = SCOPE_READONLY if fulltext else SCOPE_METADATA
+    for account in provider._accounts:
+        print(f"  - {describe_account(account, cfg)}")
+    if not provider._accounts:
+        print("  None yet.")
+    add = have_client and ask_yes_no(
+        "  Add an account?" if not provider._accounts else "  Add another account?",
+        default=not provider._accounts)
+    while add:
+        print("  Tip: with one browser profile per account, copy the link below into the "
+              "right profile.")
+        try:
+            email = login(fulltext=fulltext)
+            provider.invalidate_accounts()
+            added = next((a for a in provider.accounts() if a.identity == email), None)
+            if added:
+                print(f"  + {describe_account(added, cfg)}")
+        except LoginError as e:
+            print(f"  Login failed: {e}")
+        add = ask_yes_no("  Add another account?", default=False)
+    if fulltext:
+        stale = [a.identity for a in provider._accounts
+                 if a.source == "login" and wanted not in account_scopes(a.identity)]
+        if stale:
+            print("  These accounts were connected for names only; log in to them again to "
+                  f"search contents: {', '.join(stale)}")
+
+    print("\n5. Test")
+    provider.invalidate_accounts()
+    if not provider.accounts():
+        print("  No usable account, nothing to test. Run --setup again when you have one.")
+        return 1
+    term = ask("  Type part of a file name to try a search (empty to skip)")
+    if term:
+        files = provider.search_all(term.split())
+        files.sort(key=lambda f: f.get("modifiedTime", ""), reverse=True)
+        multi = len(provider.accounts()) > 1
+        for f in files[:5]:
+            meta = provider.result_meta(f, multi)
+            print(f"    {meta['name'].get_string()}  ({meta['description'].get_string()})")
+        print(f"  {len(files)} result(s)." if files else "  No results for that term.")
+    print("\nDone. Open the Activities overview and type to search."
+          + ("" if registration else " (After registering the provider, see step 1.)"))
+    return 0
+
+
+def account_scopes(email, accounts_dir=None):
+    try:
+        with open(account_path(email, accounts_dir)) as f:
+            return json.load(f).get("scopes") or []
+    except (OSError, ValueError):
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -988,6 +1200,8 @@ def parse_args(argv):
         "--query", nargs="+", metavar="TERM",
         help="run one search from the command line and print the results (for debugging)",
     )
+    parser.add_argument("--setup", action="store_true",
+                        help="guided setup: OAuth client, accounts and a test search")
     auth = parser.add_argument_group("accounts")
     auth.add_argument("--login", action="store_true",
                       help="add a Google account (run it once per account)")
@@ -1035,10 +1249,12 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     VERBOSE = args.verbose
     cfg = load_config(args.config)
+    if args.setup:
+        return run_setup(cfg, args.config)
     try:
         if args.login:
-            login(args.client_secret, fulltext=args.fulltext, port=args.port,
-                  open_browser=not args.no_browser)
+            login(args.client_secret, fulltext=args.fulltext or cfg["mode"] == "fulltext",
+                  port=args.port, open_browser=not args.no_browser)
             return 0
         if args.logout:
             logout(args.logout)

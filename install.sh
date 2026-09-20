@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Installs the provider for the current user (default) or system-wide (--system).
+# Add --no-setup to skip the offer to run the guided setup at the end.
 #
 # GNOME Shell only loads search provider definitions (.ini) from the system data
 # directories in XDG_DATA_DIRS, never from ~/.local/share. A per-user install
@@ -52,11 +53,22 @@ if [[ -n "${PROVIDERDIR:-}" ]]; then
   echo "  $PROVIDERDIR/$ID.ini"
   cat <<MSG
 
-Next: connect your Google accounts with: gnome-drive-search-provider --login
-(see the README), then open the Activities overview and type part of a file name.
-GNOME Shell picks the provider up right away; if the "Google Drive" section does
-not appear, check Settings > Search, or log out and back in.
+Next: connect your Google accounts with the guided setup:
+
+  $LIBEXECDIR/gnome-drive-search-provider --setup
+
+Then open the Activities overview and type part of a file name. GNOME Shell picks
+the provider up right away; if the "Google Drive" section does not appear, check
+Settings > Search, or log out and back in.
 MSG
+  # Offer the guided setup right away, but only to a person at a terminal and
+  # never as root (accounts belong to the user, not to whoever ran sudo).
+  if [[ " $* " != *" --no-setup "* && -t 0 && -t 1 && $EUID -ne 0 ]]; then
+    read -r -p "Run the guided setup now? [Y/n] " reply
+    if [[ ! "$reply" =~ ^[Nn] ]]; then
+      exec "$LIBEXECDIR/gnome-drive-search-provider" --setup
+    fi
+  fi
 else
   cat <<MSG
 
