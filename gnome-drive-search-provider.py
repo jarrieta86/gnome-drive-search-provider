@@ -27,7 +27,9 @@ import json
 import locale
 import os
 import secrets
+import shlex
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -67,6 +69,23 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.ini")
 ACCOUNTS_DIR = os.path.join(CONFIG_DIR, "accounts")
 CLIENT_SECRET_PATH = os.path.join(CONFIG_DIR, "client_secret.json")
 
+# Chromium-family browsers keep one "Local State" file per installation that
+# lists every profile and the Google account signed in to it. Keyed by the
+# desktop file id of the browser; values are relative to the user's home.
+CHROMIUM_BROWSERS = {
+    "google-chrome.desktop": ".config/google-chrome",
+    "google-chrome-beta.desktop": ".config/google-chrome-beta",
+    "google-chrome-unstable.desktop": ".config/google-chrome-unstable",
+    "chromium.desktop": ".config/chromium",
+    "chromium-browser.desktop": ".config/chromium",
+    "brave-browser.desktop": ".config/BraveSoftware/Brave-Browser",
+    "microsoft-edge.desktop": ".config/microsoft-edge",
+    "vivaldi-stable.desktop": ".config/vivaldi",
+    "com.google.Chrome.desktop": ".var/app/com.google.Chrome/config/google-chrome",
+    "org.chromium.Chromium.desktop": ".var/app/org.chromium.Chromium/config/chromium",
+    "com.brave.Browser.desktop": ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser",
+}
+
 DEFAULTS = {
     "mode": "name",  # "name" matches file names, "fulltext" also matches content
     "max_results": 10,
@@ -75,6 +94,8 @@ DEFAULTS = {
     "shared_drives": True,
     "idle_exit_seconds": 300,
     "token_file": "",
+    "use_profiles": True,
+    "profiles": {},  # manual overrides: account email -> browser profile directory
 }
 
 ICONS = {
@@ -200,6 +221,10 @@ def load_config(path=CONFIG_PATH):
     read(search, "shared_drives", boolean)
     read(search, "idle_exit_seconds", int)
     read(auth, "token_file", str)
+    browser = parser["browser"] if parser.has_section("browser") else {}
+    read(browser, "use_profiles", boolean)
+    if parser.has_section("browser_profiles"):
+        cfg["profiles"] = {k.lower(): v.strip() for k, v in parser["browser_profiles"].items()}
     if cfg["mode"] not in ("name", "fulltext"):
         log(f"config: unknown mode {cfg['mode']!r}, using 'name'", always=True)
         cfg["mode"] = "name"
@@ -249,10 +274,22 @@ class Account:
         self._token_getter = token_getter
         self._token = None
         self._expires_at = 0.0
+        self._email = identity if "@" in identity else None
+        self._email_resolved = self._email is not None
 
     @property
     def email(self):
-        return self.identity if "@" in self.identity else None
+        return self._email
+
+    def resolve_email(self):
+        """Ask Drive who this token belongs to (once), for accounts not named after it."""
+        if not self._email_resolved:
+            self._email_resolved = True
+            try:
+                self._email = fetch_email(self.token())
+            except Exception as e:  # noqa: BLE001
+                log(f"[{self.identity}] could not resolve the account email: {e}")
+        return self._email
 
     def token(self, force=False):
         if force or self._token is None or time.monotonic() >= self._expires_at:
@@ -694,6 +731,72 @@ def account_url(url, email):
 
 
 # ---------------------------------------------------------------------------
+# Opening results in the right browser profile
+# ---------------------------------------------------------------------------
+
+
+def chromium_profiles(config_dir):
+    """Map account email -> profile directory from a Chromium "Local State" file."""
+    try:
+        with open(os.path.join(config_dir, "Local State")) as f:
+            cache = json.load(f)["profile"]["info_cache"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    profiles = {}
+    for directory, info in cache.items():
+        email = (info or {}).get("user_name")
+        if email:
+            profiles.setdefault(email.lower(), directory)
+    return profiles
+
+
+def profile_command(app_id, commandline, url, email, overrides=None, home=None):
+    """argv that opens url in the browser profile of email, or None to open it normally.
+
+    Only Chromium-family browsers are handled: their profiles record the signed-in
+    Google account and they accept --profile-directory on the command line.
+    """
+    if not email or not commandline or app_id not in CHROMIUM_BROWSERS:
+        return None
+    email = email.lower()
+    directory = (overrides or {}).get(email)
+    if not directory:
+        config_dir = os.path.join(home or os.path.expanduser("~"), CHROMIUM_BROWSERS[app_id])
+        directory = chromium_profiles(config_dir).get(email)
+    if not directory:
+        return None
+    try:
+        parts = shlex.split(commandline)
+    except ValueError:
+        return None
+    # Drop desktop-entry field codes (%U, %u...) and Flatpak's @@ forwarding markers.
+    argv = [a for a in parts if not (a.startswith("%") and len(a) == 2) and not a.startswith("@@")]
+    if not argv:
+        return None
+    return argv + [f"--profile-directory={directory}", url]
+
+
+def open_url(url, email=None, cfg=None):
+    cfg = cfg or DEFAULTS
+    if email and cfg.get("use_profiles", True):
+        try:
+            app = Gio.AppInfo.get_default_for_uri_scheme("https")
+            argv = app and profile_command(
+                app.get_id(), app.get_commandline(), url, email, cfg.get("profiles")
+            )
+            if argv:
+                log(f"opening with profile: {argv[:-1]}")
+                subprocess.Popen(  # noqa: S603
+                    argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, start_new_session=True,
+                )
+                return
+        except (OSError, GLib.Error) as e:
+            log(f"could not open the browser profile, using the default handler: {e}", always=True)
+    Gio.AppInfo.launch_default_for_uri(url, None)
+
+
+# ---------------------------------------------------------------------------
 # D-Bus search provider
 # ---------------------------------------------------------------------------
 
@@ -816,9 +919,10 @@ class SearchProvider:
             except Exception as e:  # noqa: BLE001
                 log(f"[{account.identity}] search failed: {e!r}", always=True)
                 return []
+            email = account.resolve_email() if files else account.email
             for f in files:
-                f["_account"] = account.identity
-                f["_email"] = account.email
+                f["_account"] = email or account.identity
+                f["_email"] = email
             return files
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(accounts)) as pool:
@@ -858,7 +962,7 @@ class SearchProvider:
         (fid, _terms, _ts) = params.unpack()
         f = self.files.get(fid, {})
         url = f.get("webViewLink") or f"https://drive.google.com/open?id={fid}"
-        self._open(account_url(url, f.get("_email")))
+        self._open(account_url(url, f.get("_email")), f.get("_email"))
         invocation.return_value(None)
 
     def LaunchSearch(self, params, invocation):
@@ -867,9 +971,8 @@ class SearchProvider:
         self._open(f"https://drive.google.com/drive/search?q={q}")
         invocation.return_value(None)
 
-    @staticmethod
-    def _open(url):
-        Gio.AppInfo.launch_default_for_uri(url, None)
+    def _open(self, url, email=None):
+        open_url(url, email, self.cfg)
 
 
 # ---------------------------------------------------------------------------

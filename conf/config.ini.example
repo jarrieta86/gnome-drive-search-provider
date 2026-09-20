@@ -20,3 +20,13 @@ idle_exit_seconds = 300
 # "authorized_user" JSON format (keys: client_id, client_secret, refresh_token)
 # that has a Drive scope. Also settable with GNOME_DRIVE_SEARCH_TOKEN_FILE.
 # token_file = ~/.config/my-tool/google_token.json
+
+[browser]
+# Open each result in the browser profile signed in to the account that found it
+# (Chrome, Chromium, Brave, Edge, Vivaldi). Detected automatically.
+use_profiles = true
+
+# Manual mapping for profiles that are not signed in to the browser itself.
+# The directory name is the last part of "Profile Path" in chrome://version.
+# [browser_profiles]
+# me@work.com = Profile 2

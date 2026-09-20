@@ -73,7 +73,7 @@ five minutes without searches. It implements the five methods of
 - `GetResultMetas`: file name, a description with type, owner and date, and a
   themed icon matching the file type.
 - `ActivateResult`: opens the file's web link with the default browser, as the
-  account that found it.
+  account that found it and in that account's browser profile when there is one.
 - `LaunchSearch`: opens the same query in the Drive web search.
 
 Queries shorter than 3 characters are ignored to avoid hammering the API.
@@ -101,6 +101,23 @@ gnome-drive-search-provider --login             # add another account
 gnome-drive-search-provider --accounts          # list them
 gnome-drive-search-provider --logout me@x.com   # revoke and remove one
 ```
+
+**Browser profiles.** If your default browser is Chrome, Chromium, Brave, Edge
+or Vivaldi and you keep each account in its own browser profile, results open in
+the profile signed in to the account that found them. The provider reads the
+browser's own profile list, so there is nothing to configure. If a profile is
+not signed in to Chrome itself (only to Google inside it), map it by hand:
+
+```ini
+# ~/.config/gnome-drive-search-provider/config.ini
+[browser_profiles]
+me@work.com = Profile 2
+```
+
+Profile directory names are shown in `chrome://version` under *Profile Path*.
+Other browsers, and accounts with no matching profile, open in the default
+browser window as usual. Set `use_profiles = false` under `[browser]` to turn
+this off.
 
 Tokens are stored one file per account in
 `~/.config/gnome-drive-search-provider/accounts/`, readable only by you. A
@@ -161,6 +178,7 @@ default. The most useful ones:
 | `search.max_results` | `10` | Results shown per search |
 | `search.min_chars` | `3` | Shorter queries are ignored |
 | `search.shared_drives` | `true` | Include shared drives |
+| `browser.use_profiles` | `true` | Open results in the browser profile of their account |
 | `auth.token_file` | empty | Extra account from an existing token file, see above |
 
 Descriptions are shown in English or Spanish depending on your locale.
