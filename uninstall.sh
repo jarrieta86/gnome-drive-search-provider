@@ -17,6 +17,7 @@ fi
 
 pkill -u "$(id -u)" -f "^python3? .*/$BIN$" 2>/dev/null || true
 rm -f "$LIBEXECDIR/$BIN" "$DATADIR/dbus-1/services/$ID.service"
+rm -rf "$DATADIR/$BIN"
 
 # The .ini files may live in any data dir (see install.sh); remove every copy we can.
 IFS=: read -ra dirs <<< "${PROVIDERDIR:+$PROVIDERDIR/../..:}$DATADIR:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"

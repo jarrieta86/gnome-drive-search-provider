@@ -43,6 +43,10 @@ rm -f "$LIBEXECDIR/gnome-drive-search-provider" "$DATADIR/applications/$OLD_ID.d
 install -Dm 0755 "$BIN.py" "$LIBEXECDIR/$BIN"
 install -d "$DATADIR/dbus-1/services"
 sed "s|@LIBEXECDIR@|$LIBEXECDIR|" "conf/$ID.service.in" > "$DATADIR/dbus-1/services/$ID.service"
+# A distribution may ship its own OAuth client so its users never create one.
+if [[ -f conf/oauth_client.json ]]; then
+  install -Dm 0644 conf/oauth_client.json "$DATADIR/$BIN/oauth_client.json"
+fi
 for service in "${SERVICES[@]}"; do
   install -Dm 0644 "conf/$ID.$service.desktop" "$DATADIR/applications/$ID.$service.desktop"
   install -Dm 0644 "icons/$ID.$service.svg" "$DATADIR/icons/hicolor/scalable/apps/$ID.$service.svg"
