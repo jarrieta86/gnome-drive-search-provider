@@ -29,26 +29,33 @@ Drive API with the standard library.
 
 ## Install
 
-For the current user (no root needed):
-
 ```sh
 git clone https://github.com/jarrieta86/gnome-drive-search-provider.git
 cd gnome-drive-search-provider
-./install.sh
+./install.sh                  # current user
+sudo ./install.sh --system    # or: every user, under /usr/local
 ```
 
-System-wide, for every user on the machine:
+Then open the Activities overview and type. GNOME Shell reloads its providers
+when the desktop file is installed, so no restart is needed. If the **Google
+Drive** section does not appear, check that it is enabled in **Settings >
+Search**, or log out and back in.
 
-```sh
-sudo ./install.sh --system
-```
+**About per-user installs.** GNOME Shell only loads search provider definitions
+from the system data directories listed in `XDG_DATA_DIRS`; it never reads
+`~/.local/share/gnome-shell/search-providers`. `./install.sh` therefore places
+the one-line `.ini` definition in the first entry of `XDG_DATA_DIRS` that you
+can write to. With Flatpak installed that is
+`~/.local/share/flatpak/exports/share`, the same place Flatpak uses to export
+the search providers of its apps, and no root is needed. If no entry is
+writable, the installer prints the single `sudo install` command that registers
+the provider; everything else still lives in your home directory.
 
-Then open the Activities overview and type. If the **Google Drive** section does
-not appear, check that it is enabled in **Settings > Search**, and log out and
-back in if you installed system-wide (GNOME Shell reloads user providers on the
-fly, but system directories are scanned at login).
+A **Google Drive** launcher is also added to the app grid (it opens Drive in the
+browser). It has to be visible: GNOME Shell ignores search providers whose
+desktop file is hidden with `NoDisplay=true`.
 
-Remove it with `./uninstall.sh` (or `sudo ./uninstall.sh --system`).
+Remove everything with `./uninstall.sh` (or `sudo ./uninstall.sh --system`).
 
 ## How it works
 

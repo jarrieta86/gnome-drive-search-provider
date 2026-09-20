@@ -319,3 +319,59 @@ def test_conf_files_agree_on_ids():
     assert (conf / f"{provider.APP_ID}.desktop").exists()
     assert f"Name={provider.BUS_NAME}" in (conf / f"{provider.APP_ID}.service.in").read_text()
     assert os.access(SCRIPT, os.X_OK)
+
+
+def test_desktop_file_is_accepted_by_gnome_shell(monkeypatch):
+    # GNOME Shell drops providers whose desktop file fails should_show(), which
+    # is the case with NoDisplay=true or when OnlyShowIn excludes GNOME.
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
+    path = ROOT / "conf" / f"{provider.APP_ID}.desktop"
+    assert "NoDisplay" not in path.read_text()
+    gi = pytest.importorskip("gi")
+    try:
+        gi.require_version("GioUnix", "2.0")
+        from gi.repository import GioUnix
+        info = GioUnix.DesktopAppInfo.new_from_filename(str(path))
+    except (ValueError, ImportError):
+        info = provider.Gio.DesktopAppInfo.new_from_filename(str(path))
+    assert info is not None
+    assert info.should_show()
+
+
+def test_user_install_registers_ini_in_a_writable_xdg_data_dir(tmp_path):
+    # GNOME Shell never reads ~/.local/share/gnome-shell/search-providers.
+    import subprocess
+
+    home, xdg = tmp_path / "home", tmp_path / "exports"
+    home.mkdir()
+    xdg.mkdir()
+    env = dict(os.environ, HOME=str(home), XDG_DATA_DIRS=f"/nonexistent:{xdg}:/usr/share")
+    env.pop("XDG_DATA_HOME", None)
+    env.pop("PROVIDERDIR", None)
+    subprocess.run([str(ROOT / "install.sh")], check=True, env=env, capture_output=True)
+    ini = xdg / "gnome-shell" / "search-providers" / f"{provider.APP_ID}.ini"
+    assert ini.exists()
+    assert not (home / ".local/share/gnome-shell/search-providers").exists()
+    service = home / ".local/share/dbus-1/services" / f"{provider.APP_ID}.service"
+    assert f"Exec={home}/.local/bin/gnome-drive-search-provider" in service.read_text()
+
+    subprocess.run([str(ROOT / "uninstall.sh")], check=True, env=env, capture_output=True)
+    assert not ini.exists()
+    assert not service.exists()
+
+
+def test_user_install_without_writable_data_dir_explains_the_sudo_step(tmp_path):
+    import subprocess
+
+    if os.geteuid() == 0:
+        pytest.skip("root can write everywhere")
+    home, readonly = tmp_path / "home", tmp_path / "readonly"
+    home.mkdir()
+    readonly.mkdir()
+    readonly.chmod(0o555)
+    env = dict(os.environ, HOME=str(home), XDG_DATA_DIRS=f"{readonly}:/nonexistent")
+    env.pop("XDG_DATA_HOME", None)
+    env.pop("PROVIDERDIR", None)
+    out = subprocess.run([str(ROOT / "install.sh")], check=True, env=env, capture_output=True, text=True)
+    assert "ONE STEP LEFT" in out.stdout
+    assert "sudo install" in out.stdout

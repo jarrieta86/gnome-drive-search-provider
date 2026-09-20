@@ -1,23 +1,42 @@
 #!/usr/bin/env bash
 # Installs the provider for the current user (default) or system-wide (--system).
+#
+# GNOME Shell only loads search provider definitions (.ini) from the system data
+# directories in XDG_DATA_DIRS, never from ~/.local/share. A per-user install
+# therefore puts the .ini in the first user-writable XDG_DATA_DIRS entry (there
+# is one when Flatpak is installed) and asks for a system-wide install otherwise.
 set -euo pipefail
 cd "$(dirname "$(realpath "$0")")"
 
 ID=io.github.jarrieta86.DriveSearchProvider
+MODE=user
 if [[ "${1:-}" == "--system" ]]; then
-  PREFIX=${PREFIX:-/usr}
+  MODE=system
+  PREFIX=${PREFIX:-/usr/local}
   DATADIR=${DATADIR:-$PREFIX/share}
   LIBEXECDIR=${LIBEXECDIR:-$PREFIX/libexec}
+  PROVIDERDIR=${PROVIDERDIR:-$DATADIR/gnome-shell/search-providers}
 else
   DATADIR=${DATADIR:-${XDG_DATA_HOME:-$HOME/.local/share}}
   LIBEXECDIR=${LIBEXECDIR:-$HOME/.local/bin}
+  if [[ -z "${PROVIDERDIR:-}" ]]; then
+    IFS=: read -ra dirs <<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    for dir in "${dirs[@]}"; do
+      if [[ -n "$dir" && -d "$dir" && -w "$dir" ]]; then
+        PROVIDERDIR="${dir%/}/gnome-shell/search-providers"
+        break
+      fi
+    done
+  fi
 fi
 
 install -Dm 0755 gnome-drive-search-provider.py "$LIBEXECDIR/gnome-drive-search-provider"
-install -Dm 0644 "conf/$ID.ini" "$DATADIR/gnome-shell/search-providers/$ID.ini"
 install -Dm 0644 "conf/$ID.desktop" "$DATADIR/applications/$ID.desktop"
 install -d "$DATADIR/dbus-1/services"
 sed "s|@LIBEXECDIR@|$LIBEXECDIR|" "conf/$ID.service.in" > "$DATADIR/dbus-1/services/$ID.service"
+if [[ -n "${PROVIDERDIR:-}" ]]; then
+  install -Dm 0644 "conf/$ID.ini" "$PROVIDERDIR/$ID.ini"
+fi
 
 command -v update-desktop-database >/dev/null && update-desktop-database "$DATADIR/applications" 2>/dev/null || true
 # Ask the running session bus to pick up the new service file.
@@ -25,14 +44,28 @@ command -v busctl >/dev/null && busctl --user reload 2>/dev/null || true
 # Stop a previous instance so the new code is used on the next search.
 pkill -u "$(id -u)" -f "^python3? .*/gnome-drive-search-provider$" 2>/dev/null || true
 
-cat <<MSG
-Installed:
-  $LIBEXECDIR/gnome-drive-search-provider
-  $DATADIR/gnome-shell/search-providers/$ID.ini
-  $DATADIR/applications/$ID.desktop
-  $DATADIR/dbus-1/services/$ID.service
+echo "Installed:"
+echo "  $LIBEXECDIR/gnome-drive-search-provider"
+echo "  $DATADIR/applications/$ID.desktop"
+echo "  $DATADIR/dbus-1/services/$ID.service"
+if [[ -n "${PROVIDERDIR:-}" ]]; then
+  echo "  $PROVIDERDIR/$ID.ini"
+  cat <<MSG
 
 Next: add your Google account in Settings > Online Accounts (with Files enabled),
 then open the Activities overview and type part of a file name.
-If the "Google Drive" section does not appear, log out and back in.
+GNOME Shell picks the provider up right away; if the "Google Drive" section does
+not appear, check Settings > Search, or log out and back in.
 MSG
+else
+  cat <<MSG
+
+ONE STEP LEFT. GNOME Shell only reads search provider definitions from system
+directories, and none of the entries in XDG_DATA_DIRS is writable by you.
+Register the provider with:
+
+  sudo install -Dm 0644 "$PWD/conf/$ID.ini" /usr/local/share/gnome-shell/search-providers/$ID.ini
+
+or install everything system-wide with: sudo ./install.sh --system
+MSG
+fi
