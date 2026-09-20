@@ -1496,9 +1496,9 @@ def test_setup_picks_services_from_the_checklist_when_the_terminal_allows(tmp_pa
     saved = provider.load_config(provider.CONFIG_PATH)["services"]
     assert saved == {"drive": True, "gmail": True, "calendar": False, "contacts": True}
     out = capsys.readouterr().out
-    assert "[x] Gmail" in out and "[x] Google Contacts" in out and "reads ALL your mail" in out
-    assert "Gmail: needs read access to ALL your mail" in out  # full wording once chosen
-    assert "Google Calendar: needs" not in out
+    assert "[x] Gmail" in out and "[x] Google Contacts" in out and "needs to read all your mail" in out
+    assert "search mail without being able to read it" in out  # explained while highlighted
+    assert "Selected: Google Drive, Google Contacts, Gmail." in out
 
 
 def test_checklist_on_a_real_terminal_keeps_every_key_of_a_burst():
@@ -1538,3 +1538,26 @@ def test_checklist_on_a_real_terminal_keeps_every_key_of_a_burst():
     assert read_until(b"CHOSEN", 10), output
     os.waitpid(pid, 0)
     assert b"CHOSEN ['a', 'b', 'd']" in output
+
+
+def test_checklist_explains_the_highlighted_row_and_still_redraws_in_place():
+    details = {"drive": "Only names.", "gmail": "word " * 60}
+    out = io.StringIO()
+    provider.checklist(ITEMS, {"drive"}, keys=iter([DOWN, DOWN, "\r"]).__next__, out=out, width=60,
+                       details=details)
+    text = out.getvalue()
+    assert "Only names." in text
+    assert text.count("\x1b[6A") == 2  # 3 rows + blank + 2 detail lines, redrawn after each move
+    long_lines = provider.detail_lines(details["gmail"], 60)
+    assert len(long_lines) == provider.DETAIL_LINES and long_lines[-1].endswith("...")
+    assert all(len(line) <= 59 for line in long_lines)
+    assert provider.detail_lines("", 60) == ["    ", "    "]  # rows without a detail keep the height
+
+
+def test_every_service_has_a_short_note_and_an_explanation_that_fits():
+    for service in provider.SERVICES:
+        assert service.short and service.detail
+        row = provider.checklist_lines([(service.key, "Google Contacts", service.short)], set(), 0)[0]
+        assert len(row) < 80
+        shown = provider.detail_lines(service.detail, 80)
+        assert not shown[-1].endswith("..."), service.key  # fits in an 80-column terminal

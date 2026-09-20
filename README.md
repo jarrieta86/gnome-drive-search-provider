@@ -87,11 +87,17 @@ change something. It never removes anything.
    confirms:
 
    ```
-     > [x] Google Drive     file names, owners and dates
+       [x] Google Drive     file names, owners and dates
        [x] Google Contacts  reads contacts, people you wrote to, work directory
-       [ ] Gmail            reads ALL your mail
+     > [ ] Gmail            needs to read all your mail
        [ ] Google Calendar  reads your events
+
+       Google has no permission to search mail without being able to read it, so
+       this covers all your mail. Read-only; nothing is stored.
    ```
+
+   The lines under the list explain the highlighted service and change as you
+   move.
 
    Terminals that cannot be driven key by key get one yes/no question per
    service instead.
