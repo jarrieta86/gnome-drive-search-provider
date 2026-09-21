@@ -1744,7 +1744,7 @@ def guide_client_creation(cfg, config_path=None):
     print(WHY_A_CLIENT)
     print("\n  Type the email of the Google account you will create the client with, for example\n"
           "  you@gmail.com. The three pages below open in that account's browser profile.\n"
-          "  Leave it empty to only get the links.")
+          "  Or just press Enter to only get the links.")
     owner = ask("  Email")
     for number, (title, url, lines) in enumerate(creation_steps(cfg), 1):
         print(f"\n  {number}/3  {title}")
@@ -1765,7 +1765,7 @@ def guide_client_creation(cfg, config_path=None):
                        "another one", fresh[0])
         else:
             print("\n  No client_secret*.json was downloaded to ~/Downloads since this step started.")
-            path = ask("  Type the path of the JSON file you downloaded (empty to stop here)")
+            path = ask("  Type the path of the JSON file you downloaded, or just press Enter to stop here")
         if not path:
             return None
         path = os.path.expanduser(path)
@@ -1957,8 +1957,8 @@ def _setup_steps(cfg, config_path):
             client, path, address_hint = client_of_account(hint), None, hint
         else:
             print("  Type the email of the Google account to connect, for example you@gmail.com.\n"
-                  "  The login opens in that account's browser profile. Leave it empty to choose the\n"
-                  "  account in the browser instead.")
+                  "  The login opens in that account's browser profile. Or just press Enter to choose\n"
+                  "  the account in the browser instead.")
             address_hint = ask("  Email") or None
             client, path = None, pick_client(cfg, address_hint, config_path=config_path)
             if not path:
@@ -2009,7 +2009,7 @@ def _setup_steps(cfg, config_path):
     if not any(p.accounts() for p in providers):
         print("  No usable account, nothing to test. Run --setup again when you have one.")
         return 1
-    term = ask("  Type a word to search for, to check it works (empty to skip)")
+    term = ask("  Type a word to search for, to check it works, or just press Enter to skip")
     if term:
         print_results(providers, term.split(), limit=3, indent="    ")
     print("\nDone. Open the Activities overview and type to search."

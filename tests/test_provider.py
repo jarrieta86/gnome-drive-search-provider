@@ -1688,3 +1688,23 @@ def test_prompts_say_exactly_what_to_type(tmp_path, monkeypatch, capsys):
     assert "you@gmail.com" in out
     assert prompts[0] == "  Email: "
     assert "Type the path of the JSON file you downloaded" in prompts[-1]
+
+
+def test_prompts_never_say_empty_and_never_contradict_their_default(tmp_path, monkeypatch):
+    # "(empty to stop)" next to a [default] told the user two opposite things about Enter.
+    import re
+
+    source = SCRIPT.read_text()
+    asks = re.findall(r"ask(?:_yes_no)?\((?:.|\n)*?\)\n", source)
+    assert asks and not [a for a in asks if re.search(r"\bempty\b", a, re.I)]
+    # With a freshly downloaded file Enter uses it, and the prompt says exactly that.
+    downloads = tmp_path / "Downloads"
+
+    def download():
+        write_named_client(downloads, "client_secret_new.json", "555")
+        return ""
+
+    _, prompts, _, _ = setup_env(tmp_path, monkeypatch, ["", "", "", download, ""])
+    assert provider.guide_client_creation(dict(provider.DEFAULTS)).endswith("client_secret_new.json")
+    assert "Press Enter to use the file you just downloaded" in prompts[-1]
+    assert "stop" not in prompts[-1]
