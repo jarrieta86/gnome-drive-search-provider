@@ -1670,3 +1670,20 @@ def test_new_client_becomes_the_default_when_there_is_none(tmp_path, monkeypatch
     setup_env(tmp_path, monkeypatch, ["", "", "", download, ""])
     assert provider.run_new_client(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 0
     assert provider.load_client_secret(str(cfg_dir / "client_secret.json"))["project"] == "proj-222"
+
+
+def test_prompts_say_exactly_what_to_type(tmp_path, monkeypatch, capsys):
+    # Yes/no questions spell out what Enter does.
+    _, prompts, _, _ = setup_env(tmp_path, monkeypatch, ["", ""])
+    assert provider.ask_yes_no("  Add another account?", default=False) is False
+    assert provider.ask_yes_no("  Add an account?", default=True) is True
+    assert prompts == ["  Add another account? [y/n, Enter = no]: ",
+                       "  Add an account? [y/n, Enter = yes]: "]
+    # Asking for an email says so, with an example, and the prompt itself is one word.
+    _, prompts, _, _ = setup_env(tmp_path, monkeypatch, ["", "", "", "", ""])
+    provider.guide_client_creation(dict(provider.DEFAULTS))
+    out = capsys.readouterr().out
+    assert "Type the email of the Google account you will create the client with" in out
+    assert "you@gmail.com" in out
+    assert prompts[0] == "  Email: "
+    assert "Type the path of the JSON file you downloaded" in prompts[-1]

@@ -1531,7 +1531,8 @@ def ask(prompt, default=""):
 
 
 def ask_yes_no(prompt, default=True):
-    answer = ask(f"{prompt} ({'Y/n' if default else 'y/N'})").lower()
+    # Say what Enter does instead of relying on the Y/n capitalization convention.
+    answer = ask(f"{prompt} [y/n, Enter = {'yes' if default else 'no'}]").lower()
     if not answer:
         return default
     return answer in ("y", "yes", "s", "si", "sí")
@@ -1738,8 +1739,10 @@ def guide_client_creation(cfg, config_path=None):
     """
     started = time.time()
     print(WHY_A_CLIENT)
-    owner = ask("\n  Google account to create it with, to open the pages in its browser profile "
-                "(Enter: only print links)")
+    print("\n  Type the email of the Google account you will create the client with, for example\n"
+          "  you@gmail.com. The three pages below open in that account's browser profile.\n"
+          "  Leave it empty to only get the links.")
+    owner = ask("  Email")
     for number, (title, url, lines) in enumerate(creation_steps(cfg), 1):
         print(f"\n  {number}/3  {title}")
         target = account_url(url, owner or None)
@@ -1751,13 +1754,15 @@ def guide_client_creation(cfg, config_path=None):
                 open_url(target, owner, cfg)
             except GLib.Error as e:
                 print(f"    (could not open the browser: {e.message}; open the link yourself)")
-        ask("    Press Enter when that is done")
+        ask("    Press Enter when you have done that")
     while True:
         fresh = find_client_secret_candidates(since=started)
-        if not fresh:
-            print("\n  No client_secret*.json downloaded to ~/Downloads since this step started.")
-        path = ask("\n  Client JSON (empty to stop)" if fresh else "  Client JSON (empty to stop)",
-                   fresh[0] if fresh else "")
+        if fresh:
+            path = ask("\n  Press Enter to use the file you just downloaded, or type the path of "
+                       "another one", fresh[0])
+        else:
+            print("\n  No client_secret*.json was downloaded to ~/Downloads since this step started.")
+            path = ask("  Type the path of the JSON file you downloaded (empty to stop here)")
         if not path:
             return None
         path = os.path.expanduser(path)
@@ -1815,7 +1820,7 @@ def pick_client(cfg, account=None, exclude=(), config_path=None):
     for index, (client, _path) in enumerate(clients, 1):
         print(f"    {index}) {client_label(client, cfg)}")
     print("    n) create a new one")
-    answer = ask("  Choice", str(default)).lower()
+    answer = ask("  Type the number of the client to use, or n for a new one", str(default)).lower()
     if answer == "n":
         path = guide_client_creation(cfg, config_path)
         return remember_client(path) if path else None
@@ -1948,8 +1953,10 @@ def _setup_steps(cfg, config_path):
             # Same client it was connected with: its refresh token belongs to that client.
             client, path, address_hint = client_of_account(hint), None, hint
         else:
-            address_hint = ask("  Account email, to open the login in its browser profile "
-                               "(Enter to skip)") or None
+            print("  Type the email of the Google account to connect, for example you@gmail.com.\n"
+                  "  The login opens in that account's browser profile. Leave it empty to choose the\n"
+                  "  account in the browser instead.")
+            address_hint = ask("  Email") or None
             client, path = None, pick_client(cfg, address_hint, config_path=config_path)
             if not path:
                 return
@@ -1999,7 +2006,7 @@ def _setup_steps(cfg, config_path):
     if not any(p.accounts() for p in providers):
         print("  No usable account, nothing to test. Run --setup again when you have one.")
         return 1
-    term = ask("  Type a word to try a search (empty to skip)")
+    term = ask("  Type a word to search for, to check it works (empty to skip)")
     if term:
         print_results(providers, term.split(), limit=3, indent="    ")
     print("\nDone. Open the Activities overview and type to search."
