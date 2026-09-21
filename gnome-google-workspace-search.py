@@ -1717,11 +1717,14 @@ def creation_steps(cfg):
     return [
         ("Create a project and enable the APIs",
          "https://console.cloud.google.com/flows/enableapi?apiid=" + apis,
-         [f"Create project > Next > Enable. Enables: {names}.",
+         ["Choose 'Create project', not an existing one: a project carries its app name and "
+          "audience, and one made for something else may only accept its own organization.",
+          f"Then Next > Enable. Enables: {names}.",
           "First-time Cloud users accept the terms there. No billing account needed."]),
         ("Configure the OAuth consent screen",
          "https://console.cloud.google.com/auth/overview",
-         ["Get started > App name: any (shown at login) > Audience: External > Finish.",
+         ["Check that the project named at the top is the one you just created.",
+          "Get started > App name: any (shown at login) > Audience: External > Finish.",
           "Then Audience > Publish app. Left in Testing, refresh tokens expire after 7 days "
           "and only listed test users can log in."]),
         ("Create the client",

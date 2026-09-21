@@ -906,6 +906,7 @@ def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path,
     out = capsys.readouterr().out
     assert "OK: GNOME Shell can see the search sections" in out and "/usr/share/p)" in out
     assert "Audience: External" in out and "Publish app" in out and "Desktop app" in out
+    assert "Choose 'Create project', not an existing one" in out
     assert "Google Drive: 2 result(s)" in out
     assert "Gmail:" not in out.split("5. Test")[1]  # disabled services are not searched
 
