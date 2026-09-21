@@ -1956,10 +1956,18 @@ def _setup_steps(cfg, config_path):
             # Same client it was connected with: its refresh token belongs to that client.
             client, path, address_hint = client_of_account(hint), None, hint
         else:
-            print("  Type the email of the Google account to connect, for example you@gmail.com.\n"
-                  "  The login opens in that account's browser profile. Or just press Enter to choose\n"
-                  "  the account in the browser instead.")
-            address_hint = ask("  Email") or None
+            # The account a client was created with is the obvious first one to connect.
+            connected = {a.identity.lower() for a in manager.all()}
+            suggested = next((owner for owner in (cfg.get("client_owners") or {}).values()
+                              if owner.lower() not in connected), "")
+            if suggested:
+                print(f"  Press Enter to connect {suggested}, or type the email of another Google "
+                      "account.\n  The login opens in that account's browser profile.")
+            else:
+                print("  Type the email of the Google account to connect, for example you@gmail.com.\n"
+                      "  The login opens in that account's browser profile. Or just press Enter to "
+                      "choose\n  the account in the browser instead.")
+            address_hint = ask("  Email", suggested) or None
             client, path = None, pick_client(cfg, address_hint, config_path=config_path)
             if not path:
                 return
@@ -1995,7 +2003,8 @@ def _setup_steps(cfg, config_path):
             print(f"    Cannot search {', '.join(s.label for s in lacking)}: its token does not "
                   "cover them.")
     if not manager.all():
-        print("  None yet.")
+        print("  No account connected yet. The OAuth client only identifies the app: each account\n"
+              "  still logs in and approves, once.")
     add = have_client and ask_yes_no(
         "  Add an account?" if not manager.all() else "  Add another account?",
         default=not manager.all())

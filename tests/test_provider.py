@@ -883,9 +883,9 @@ def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path,
         download,        # step 3 done: the browser saved the JSON
         "",              # path: accept the fresh download
         "",              # add an account? default yes
-        "",              # its email: skip
+        "",              # its email: Enter accepts the account the client was created with
         "y",             # add another?
-        "",              # its email: skip
+        "me@work.com",   # its email
         "",              # add another? default no
         "budget",        # test search
     ]
@@ -894,6 +894,8 @@ def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path,
     assert run_setup_with_config() == 0
     assert queue == []
     assert "client_secret_new.json" in prompts[9] and "old" not in prompts[9]
+    assert prompts[11] == "  Email [me@gmail.com]: "   # suggested: the owner of the new client
+    assert prompts[13] == "  Email: "                  # nobody left to suggest
     pages = [url for url, _ in prompts.opened]
     assert "flows/enableapi?apiid=drive.googleapis.com" in pages[0]
     assert "/auth/overview" in pages[1] and "/auth/clients/create" in pages[2]
@@ -905,6 +907,8 @@ def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path,
     assert provider.load_client_secret(str(stored))["project"] == "proj-555"
     out = capsys.readouterr().out
     assert "OK: GNOME Shell can see the search sections" in out and "/usr/share/p)" in out
+    assert "No account connected yet. The OAuth client only identifies the app" in out
+    assert "Press Enter to connect me@gmail.com, or type the email of another" in out
     assert "Audience: External" in out and "Publish app" in out and "Desktop app" in out
     assert "Choose 'Create project', not an existing one" in out
     assert "Google Drive: 2 result(s)" in out
