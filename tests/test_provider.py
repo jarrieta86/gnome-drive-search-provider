@@ -828,6 +828,7 @@ def setup_env(tmp_path, monkeypatch, answers, registered=True):
     opened = []
     monkeypatch.setattr(provider, "open_url", lambda url, email=None, cfg=None: opened.append((url, email)))
     monkeypatch.setattr(provider, "bundled_client_path", lambda: None)
+    monkeypatch.setattr(provider, "ensure_section_order", lambda: False)  # never touch real gsettings
     prompts.opened = opened
     logins = []
     emails = iter(["me@gmail.com", "me@work.com"])
@@ -1712,3 +1713,27 @@ def test_prompts_never_say_empty_and_never_contradict_their_default(tmp_path, mo
     assert provider.guide_client_creation(dict(provider.DEFAULTS)).endswith("client_secret_new.json")
     assert "Press Enter to use the file you just downloaded" in prompts[-1]
     assert "stop" not in prompts[-1]
+
+
+def test_sections_are_registered_in_gnome_sort_order_without_disturbing_it():
+    ours = [f"{provider.APP_ID}.{n}.desktop" for n in SERVICE_NAMES]
+    theirs = ["org.gnome.Settings.desktop", "org.gnome.Nautilus.desktop"]
+    # First time: appended after whatever the user has, Drive first.
+    assert provider.merged_sort_order(theirs, ours) == theirs + ours
+    # Already there, even rearranged by the user: untouched.
+    shuffled = [ours[2], "org.gnome.Nautilus.desktop", ours[0], ours[1], ours[3]]
+    assert provider.merged_sort_order(shuffled, ours) == shuffled
+    # A section from a newer version joins the ones already placed.
+    partial = [ours[0], ours[2], "org.gnome.Nautilus.desktop"]
+    assert provider.merged_sort_order(partial, ours) == [
+        ours[0], ours[2], ours[1], ours[3], "org.gnome.Nautilus.desktop"]
+
+
+def test_setup_reports_the_section_order_only_when_it_changes_it(tmp_path, monkeypatch, capsys):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    connect(cfg_dir, "me@work.com")
+    setup_env(tmp_path, monkeypatch, DRIVE_ONLY + ["", ""])
+    monkeypatch.setattr(provider, "ensure_section_order", lambda: True)
+    assert run_setup_with_config() == 0
+    assert ("order in the overview is now Google Drive, Google Contacts, Gmail, Google Calendar"
+            in capsys.readouterr().out)

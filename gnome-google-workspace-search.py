@@ -1683,6 +1683,40 @@ def choose_services(cfg):
         cfg["mode"] = "name"
 
 
+def merged_sort_order(current, ours):
+    """GNOME's search sort-order with our sections added, in our order.
+
+    GNOME Shell shows the providers listed in sort-order first and every other one
+    alphabetically, which would put Gmail before Google Drive. Ours are only appended:
+    whatever the user already arranged, including ours, is left as it is.
+    """
+    order = list(current)
+    missing = [desktop_id for desktop_id in ours if desktop_id not in order]
+    if len(missing) == len(ours):
+        return order + list(ours)
+    for desktop_id in missing:
+        # A section added by a later version goes right after the ones already placed.
+        last = max(order.index(i) for i in ours if i in order)
+        order.insert(last + 1, desktop_id)
+    return order
+
+
+def ensure_section_order():
+    """Register our sections in GNOME's sort-order; True if it changed, None if unavailable."""
+    schema = "org.gnome.desktop.search-providers"
+    source = Gio.SettingsSchemaSource.get_default()
+    if source is None or source.lookup(schema, True) is None:
+        return None
+    settings = Gio.Settings.new(schema)
+    current = list(settings.get_strv("sort-order"))
+    wanted = merged_sort_order(current, [f"{APP_ID}.{s.object_name}.desktop" for s in SERVICES])
+    if wanted == current:
+        return False
+    settings.set_strv("sort-order", wanted)
+    Gio.Settings.sync()
+    return True
+
+
 def provider_registration(service=None):
     """Path of the .ini GNOME Shell will load for a service, or None if it cannot see it."""
     service = service or SERVICES_BY_KEY["drive"]
@@ -1929,6 +1963,9 @@ def _setup_steps(cfg, config_path):
     registered = {s.key: provider_registration(s) for s in SERVICES}
     if all(registered.values()):
         print("  OK: GNOME Shell can see the search sections, nothing to do here.")
+        if ensure_section_order():
+            print("  Their order in the overview is now " + ", ".join(s.label for s in SERVICES)
+                  + ", after your other results. Rearrange them in Settings > Search.")
         print(f"  (their definitions are installed in {os.path.dirname(registered['drive'])})")
     else:
         missing = ", ".join(s.label for s in SERVICES if not registered[s.key])

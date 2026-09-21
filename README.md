@@ -125,6 +125,13 @@ about who else can read your home directory before enabling Gmail.
 A service can also be hidden at any time in **Settings > Search** without
 touching its permission.
 
+**Order of the sections.** GNOME Shell shows the providers listed in its
+`sort-order` setting first and every other one alphabetically, which would put
+Gmail above Google Drive. The setup therefore appends the four sections to that
+setting in the project's order (Drive, Contacts, Gmail, Calendar), after whatever
+you already had. It never rearranges existing entries, so an order you choose
+later in **Settings > Search** sticks.
+
 ### Several accounts
 
 Every account is searched at the same time, each result says which account it
