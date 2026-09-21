@@ -1500,11 +1500,9 @@ API_IDS = {"drive": "drive.googleapis.com", "gmail": "gmail.googleapis.com",
            "calendar": "calendar-json.googleapis.com", "contacts": "people.googleapis.com"}
 
 WHY_A_CLIENT = """\
-  Google only lets a program ask for access on behalf of an "OAuth client" that is
-  registered in a Google Cloud project. This copy of the project does not ship one,
-  so you register yours: free, about five minutes, only once. No file of yours is
-  involved yet: the client only identifies the app; access is granted later, per
-  account, in your browser."""
+  You need a Google Cloud OAuth client: one-time setup, about 5 minutes, free.
+  Google requires one to identify any app that asks for access; it grants nothing
+  by itself. This project does not bundle one, so you create yours in three pages."""
 
 REFUSED_HINT = """\
   If Google refused the account, the usual reasons are:
@@ -1710,20 +1708,19 @@ def creation_steps(cfg):
     apis = ",".join(API_IDS[s.key] for s in enabled_services(cfg)) or API_IDS["drive"]
     names = ", ".join(s.api for s in enabled_services(cfg)) or DriveService.api
     return [
-        ("Project and APIs",
+        ("Create a project and enable the APIs",
          "https://console.cloud.google.com/flows/enableapi?apiid=" + apis,
-         [f"Pick 'Create project' (any name), continue, and press Enable. This turns on: {names}.",
-          "A first-time Google Cloud user is asked to accept its terms; no billing is needed."]),
-        ("Consent screen",
+         [f"Create project > Next > Enable. Enables: {names}.",
+          "First-time Cloud users accept the terms there. No billing account needed."]),
+        ("Configure the OAuth consent screen",
          "https://console.cloud.google.com/auth/overview",
-         ["Press 'Get started'. App name: anything, it is what the login page will show.",
-          "Audience: External. (Internal only accepts accounts of one Workspace organization.)",
-          "Finish, then open 'Audience' in the left menu and press 'Publish app'.",
-          "Skipping 'Publish app' leaves it in Testing: logins expire every 7 days."]),
-        ("OAuth client",
+         ["Get started > App name: any (shown at login) > Audience: External > Finish.",
+          "Then Audience > Publish app. Left in Testing, refresh tokens expire after 7 days "
+          "and only listed test users can log in."]),
+        ("Create the client",
          "https://console.cloud.google.com/auth/clients/create",
-         ["Application type: 'Desktop app'. Create, then 'Download JSON'.",
-          "Leave the file in your Downloads folder; the next step picks it up."]),
+         ["Application type: Desktop app > Create > Download JSON.",
+          "Leave the file in ~/Downloads; it is picked up next."]),
     ]
 
 
@@ -1731,10 +1728,10 @@ def guide_client_creation(cfg):
     """Walk through registering an OAuth client in the browser; returns its path or None."""
     started = time.time()
     print(WHY_A_CLIENT)
-    owner = ask("\n  Google account that will own the client (a personal one accepts any account "
-                "later; empty to skip opening pages)")
+    owner = ask("\n  Google account to create it with, to open the pages in its browser profile "
+                "(Enter: only print links)")
     for number, (title, url, lines) in enumerate(creation_steps(cfg), 1):
-        print(f"\n  Step {number} of 3: {title}")
+        print(f"\n  {number}/3  {title}")
         target = account_url(url, owner or None)
         print(f"    {target}")
         for line in lines:
@@ -1747,7 +1744,10 @@ def guide_client_creation(cfg):
         ask("    Press Enter when that is done")
     while True:
         fresh = find_client_secret_candidates(since=started)
-        path = ask("\n  Path to the JSON you just downloaded (empty to stop)", fresh[0] if fresh else "")
+        if not fresh:
+            print("\n  No client_secret*.json downloaded to ~/Downloads since this step started.")
+        path = ask("\n  Client JSON (empty to stop)" if fresh else "  Client JSON (empty to stop)",
+                   fresh[0] if fresh else "")
         if not path:
             return None
         path = os.path.expanduser(path)
@@ -1773,8 +1773,8 @@ def setup_client(store=None, cfg=None):
         try:
             client = load_client_secret(current)
             origin = "yours" if current == store else "shipped with this install"
-            print(f"  OAuth client: ready ({origin}, Google Cloud project {client['project']})")
-            print(f"  That project must have these APIs enabled: {apis}.")
+            print(f"  OAuth client: ready ({origin}, Google Cloud project {client['project']}).")
+            print(f"  APIs that project needs enabled: {apis}.")
             return True
         except LoginError as e:
             print(f"  The stored OAuth client is unusable: {e}")
