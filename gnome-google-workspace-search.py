@@ -1774,7 +1774,9 @@ def guide_client_creation(cfg, config_path=None):
     Any Google account can own the client, personal or from an organization. The owner
     is remembered so the client can be told apart later.
     """
-    started = time.time()
+    # File timestamps come from a coarser clock than time.time() and can read a few
+    # milliseconds earlier than "now", so allow a little slack when asking what is new.
+    started = time.time() - 2
     print(WHY_A_CLIENT)
     print("\n  Type the email of the Google account you will create the client with, for example\n"
           "  you@gmail.com. The three pages below open in that account's browser profile.\n"
