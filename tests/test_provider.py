@@ -828,6 +828,7 @@ def setup_env(tmp_path, monkeypatch, answers, registered=True):
     opened = []
     monkeypatch.setattr(provider, "open_url", lambda url, email=None, cfg=None: opened.append((url, email)))
     monkeypatch.setattr(provider, "bundled_client_path", lambda: None)
+    monkeypatch.setattr(provider, "ensure_section_order", lambda: False)  # never touch real gsettings
     prompts.opened = opened
     logins = []
     emails = iter(["me@gmail.com", "me@work.com"])
@@ -883,7 +884,9 @@ def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path,
         download,        # step 3 done: the browser saved the JSON
         "",              # path: accept the fresh download
         "",              # add an account? default yes
+        "",              # its email: Enter accepts the account the client was created with
         "y",             # add another?
+        "me@work.com",   # its email
         "",              # add another? default no
         "budget",        # test search
     ]
@@ -892,6 +895,8 @@ def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path,
     assert run_setup_with_config() == 0
     assert queue == []
     assert "client_secret_new.json" in prompts[9] and "old" not in prompts[9]
+    assert prompts[11] == "  Email [me@gmail.com]: "   # suggested: the owner of the new client
+    assert prompts[13] == "  Email: "                  # nobody left to suggest
     pages = [url for url, _ in prompts.opened]
     assert "flows/enableapi?apiid=drive.googleapis.com" in pages[0]
     assert "/auth/overview" in pages[1] and "/auth/clients/create" in pages[2]
@@ -903,7 +908,10 @@ def test_setup_walks_a_new_user_through_client_two_accounts_and_a_test(tmp_path,
     assert provider.load_client_secret(str(stored))["project"] == "proj-555"
     out = capsys.readouterr().out
     assert "OK: GNOME Shell can see the search sections" in out and "/usr/share/p)" in out
+    assert "No account connected yet. The OAuth client only identifies the app" in out
+    assert "Press Enter to connect me@gmail.com, or type the email of another" in out
     assert "Audience: External" in out and "Publish app" in out and "Desktop app" in out
+    assert "Choose 'Create project', not an existing one" in out
     assert "Google Drive: 2 result(s)" in out
     assert "Gmail:" not in out.split("5. Test")[1]  # disabled services are not searched
 
@@ -1375,7 +1383,8 @@ def test_setup_offers_another_client_when_google_refuses_the_account(tmp_path, m
 
     answers = DRIVE_ONLY + [
         "",              # add an account? default yes
-        "",              # register another client now? default yes
+        "me@gmail.com",  # the account to connect
+        "",              # (refused) create an OAuth client for this account now? default yes
         "me@gmail.com",  # owner of the new client
         "", "", download,
         "",              # path: accept the fresh download
@@ -1386,11 +1395,11 @@ def test_setup_offers_another_client_when_google_refuses_the_account(tmp_path, m
     monkeypatch.setattr(provider, "CLIENTS_DIR", str(cfg_dir / "clients"))
     attempts = []
 
-    def picky_login(client_secret=None, scopes=None, client=None, **kw):
-        attempts.append(client_secret)
-        if client_secret is None:
-            raise KeyboardInterrupt  # the person saw org_internal and pressed Ctrl+C
+    def picky_login(client_secret=None, scopes=None, client=None, login_hint=None, **kw):
+        attempts.append((client_secret, login_hint))
         chosen = provider.load_client_secret(client_secret)
+        if chosen["project"] == "proj-111":
+            raise KeyboardInterrupt  # the person saw org_internal and pressed Ctrl+C
         payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
         provider.save_account("me@gmail.com", chosen, payload, " ".join(scopes))
         return "me@gmail.com"
@@ -1399,7 +1408,10 @@ def test_setup_offers_another_client_when_google_refuses_the_account(tmp_path, m
     assert run_setup_with_config() == 0
     assert queue == []
     kept = str(cfg_dir / "clients" / "proj-222.json")
-    assert attempts == [None, kept]  # stored under clients/, the default is untouched
+    default = str(cfg_dir / "client_secret.json")
+    # The second client is stored under clients/; the default one is untouched.
+    assert attempts == [(default, "me@gmail.com"), (kept, "me@gmail.com")]
+    assert provider.load_config(provider.CONFIG_PATH)["client_owners"] == {"proj-222": "me@gmail.com"}
     assert provider.load_client_secret(str(cfg_dir / "client_secret.json"))["project"] == "proj-111"
     out = capsys.readouterr().out
     assert "Login cancelled." in out
@@ -1561,3 +1573,167 @@ def test_every_service_has_a_short_note_and_an_explanation_that_fits():
         assert len(row) < 80
         shown = provider.detail_lines(service.detail, 80)
         assert not shown[-1].endswith("..."), service.key  # fits in an 80-column terminal
+
+
+# ---------------------------------------------------------------------------
+# Any account may own a client; any client may serve any account
+# ---------------------------------------------------------------------------
+
+
+def two_clients(tmp_path, monkeypatch, answers):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    write_named_client(cfg_dir, "client_secret.json", "111")
+    write_named_client(cfg_dir / "clients", "proj-222.json", "222")
+    _, prompts, queue, _ = setup_env(tmp_path, monkeypatch, answers)
+    monkeypatch.setattr(provider, "CLIENTS_DIR", str(cfg_dir / "clients"))
+    cfg = provider.load_config(provider.CONFIG_PATH)
+    cfg["client_owners"] = {"proj-111": "me@work.com", "proj-222": "me@gmail.com"}
+    return cfg_dir, cfg, prompts, queue
+
+
+def test_pick_client_defaults_to_the_one_created_with_the_same_domain(tmp_path, monkeypatch, capsys):
+    cfg_dir, cfg, prompts, _ = two_clients(tmp_path, monkeypatch, ["", "", "1"])
+    assert provider.pick_client(cfg, "other@gmail.com") == str(cfg_dir / "clients" / "proj-222.json")
+    assert "[2]" in prompts[0]                       # same domain as the owner of proj-222
+    assert provider.pick_client(cfg, "boss@work.com") == str(cfg_dir / "client_secret.json")
+    assert "[1]" in prompts[1]
+    # The default is only a suggestion: a work client can serve a personal account.
+    assert provider.pick_client(cfg, "other@gmail.com") == str(cfg_dir / "client_secret.json")
+    out = capsys.readouterr().out
+    assert "1) proj-111 (created with me@work.com)" in out
+    assert "2) proj-222 (created with me@gmail.com)" in out and "n) create a new one" in out
+
+
+def test_pick_client_is_silent_with_a_single_client(tmp_path, monkeypatch):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    write_named_client(cfg_dir, "client_secret.json", "111")
+    _, prompts, _, _ = setup_env(tmp_path, monkeypatch, [])
+    assert provider.pick_client(dict(provider.DEFAULTS), "a@b.c") == str(cfg_dir / "client_secret.json")
+    assert prompts == []
+
+
+def test_pick_client_can_create_a_new_one_with_any_account(tmp_path, monkeypatch):
+    downloads = tmp_path / "Downloads"
+
+    def download():
+        write_named_client(downloads, "client_secret_new.json", "333")
+        return ""
+
+    cfg_dir, cfg, _, queue = two_clients(
+        tmp_path, monkeypatch, ["n", "me@work.com", "", "", download, ""])
+    path = provider.pick_client(cfg, "me@work.com", config_path=provider.CONFIG_PATH)
+    assert queue == []
+    assert path == str(cfg_dir / "clients" / "proj-333.json")
+    assert provider.load_config(provider.CONFIG_PATH)["client_owners"]["proj-333"] == "me@work.com"
+    assert [c["project"] for c, _ in provider.known_clients()] == ["proj-111", "proj-222", "proj-333"]
+
+
+def test_login_opens_in_the_browser_profile_of_the_account(tmp_path, monkeypatch, capsys):
+    write_local_state(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    launched = patch_launchers(monkeypatch, FakeApp("google-chrome.desktop", "/opt/chrome %U"))
+    secret = write_client_secret(tmp_path)
+    with pytest.raises(provider.LoginError, match="timed out"):
+        provider.login(str(secret), timeout=0.2, login_hint="me@gmail.com",
+                       accounts_dir=str(tmp_path / "a"), client_secret_store=str(tmp_path / "s.json"))
+    argv = launched["popen"][0]
+    assert argv[:2] == ["/opt/chrome", "--profile-directory=Profile 1"]
+    assert "login_hint=me%40gmail.com" in argv[2]
+    assert launched["default"] == []
+
+
+def test_login_says_when_another_account_was_used(tmp_path, monkeypatch, capsys):
+    fake_browser(monkeypatch)
+    fake_google(monkeypatch, "actual@gmail.com", [])
+    provider.login(str(write_client_secret(tmp_path)), timeout=10, login_hint="asked@gmail.com",
+                   accounts_dir=str(tmp_path / "a"), client_secret_store=str(tmp_path / "s.json"))
+    assert "you asked for asked@gmail.com but logged in as actual@gmail.com" in capsys.readouterr().out
+
+
+def test_new_client_registers_an_extra_client_without_touching_the_default(tmp_path, monkeypatch, capsys):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    write_named_client(cfg_dir, "client_secret.json", "111")
+
+    def download():
+        write_named_client(tmp_path / "Downloads", "client_secret_new.json", "222")
+        return ""
+
+    _, _, queue, _ = setup_env(tmp_path, monkeypatch, ["me@work.com", "", "", download, ""])
+    monkeypatch.setattr(provider, "CLIENTS_DIR", str(cfg_dir / "clients"))
+    assert provider.run_new_client(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 0
+    assert queue == []
+    assert [c["project"] for c, _ in provider.known_clients()] == ["proj-111", "proj-222"]
+    assert provider.load_config(provider.CONFIG_PATH)["client_owners"] == {"proj-222": "me@work.com"}
+
+
+def test_new_client_becomes_the_default_when_there_is_none(tmp_path, monkeypatch):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+
+    def download():
+        write_named_client(tmp_path / "Downloads", "client_secret_new.json", "222")
+        return ""
+
+    setup_env(tmp_path, monkeypatch, ["", "", "", download, ""])
+    assert provider.run_new_client(provider.load_config(provider.CONFIG_PATH), provider.CONFIG_PATH) == 0
+    assert provider.load_client_secret(str(cfg_dir / "client_secret.json"))["project"] == "proj-222"
+
+
+def test_prompts_say_exactly_what_to_type(tmp_path, monkeypatch, capsys):
+    # Yes/no questions spell out what Enter does.
+    _, prompts, _, _ = setup_env(tmp_path, monkeypatch, ["", ""])
+    assert provider.ask_yes_no("  Add another account?", default=False) is False
+    assert provider.ask_yes_no("  Add an account?", default=True) is True
+    assert prompts == ["  Add another account? [y/n, Enter = no]: ",
+                       "  Add an account? [y/n, Enter = yes]: "]
+    # Asking for an email says so, with an example, and the prompt itself is one word.
+    _, prompts, _, _ = setup_env(tmp_path, monkeypatch, ["", "", "", "", ""])
+    provider.guide_client_creation(dict(provider.DEFAULTS))
+    out = capsys.readouterr().out
+    assert "Type the email of the Google account you will create the client with" in out
+    assert "you@gmail.com" in out
+    assert prompts[0] == "  Email: "
+    assert "Type the path of the JSON file you downloaded" in prompts[-1]
+
+
+def test_prompts_never_say_empty_and_never_contradict_their_default(tmp_path, monkeypatch):
+    # "(empty to stop)" next to a [default] told the user two opposite things about Enter.
+    import re
+
+    source = SCRIPT.read_text()
+    asks = re.findall(r"ask(?:_yes_no)?\((?:.|\n)*?\)\n", source)
+    assert asks and not [a for a in asks if re.search(r"\bempty\b", a, re.I)]
+    # With a freshly downloaded file Enter uses it, and the prompt says exactly that.
+    downloads = tmp_path / "Downloads"
+
+    def download():
+        write_named_client(downloads, "client_secret_new.json", "555")
+        return ""
+
+    _, prompts, _, _ = setup_env(tmp_path, monkeypatch, ["", "", "", download, ""])
+    assert provider.guide_client_creation(dict(provider.DEFAULTS)).endswith("client_secret_new.json")
+    assert "Press Enter to use the file you just downloaded" in prompts[-1]
+    assert "stop" not in prompts[-1]
+
+
+def test_sections_are_registered_in_gnome_sort_order_without_disturbing_it():
+    ours = [f"{provider.APP_ID}.{n}.desktop" for n in SERVICE_NAMES]
+    theirs = ["org.gnome.Settings.desktop", "org.gnome.Nautilus.desktop"]
+    # First time: appended after whatever the user has, Drive first.
+    assert provider.merged_sort_order(theirs, ours) == theirs + ours
+    # Already there, even rearranged by the user: untouched.
+    shuffled = [ours[2], "org.gnome.Nautilus.desktop", ours[0], ours[1], ours[3]]
+    assert provider.merged_sort_order(shuffled, ours) == shuffled
+    # A section from a newer version joins the ones already placed.
+    partial = [ours[0], ours[2], "org.gnome.Nautilus.desktop"]
+    assert provider.merged_sort_order(partial, ours) == [
+        ours[0], ours[2], ours[1], ours[3], "org.gnome.Nautilus.desktop"]
+
+
+def test_setup_reports_the_section_order_only_when_it_changes_it(tmp_path, monkeypatch, capsys):
+    cfg_dir, *_ = setup_env(tmp_path, monkeypatch, [])
+    connect(cfg_dir, "me@work.com")
+    setup_env(tmp_path, monkeypatch, DRIVE_ONLY + ["", ""])
+    monkeypatch.setattr(provider, "ensure_section_order", lambda: True)
+    assert run_setup_with_config() == 0
+    assert ("order in the overview is now Google Drive, Google Contacts, Gmail, Google Calendar"
+            in capsys.readouterr().out)

@@ -139,6 +139,7 @@ DEFAULTS = {
     "services": {"drive": True, "contacts": True, "gmail": False, "calendar": False},
     "use_profiles": True,
     "profiles": {},  # manual overrides: account email -> browser profile directory
+    "client_owners": {},  # Google Cloud project of an OAuth client -> account that created it
 }
 
 ICONS = {
@@ -276,6 +277,8 @@ def load_config(path=CONFIG_PATH):
         cfg["services"] = dict(cfg["services"])
     browser = parser["browser"] if parser.has_section("browser") else {}
     read(browser, "use_profiles", boolean)
+    cfg["client_owners"] = (dict(parser["client_owners"]) if parser.has_section("client_owners")
+                            else {})
     if parser.has_section("browser_profiles"):
         cfg["profiles"] = {k.lower(): v.strip() for k, v in parser["browser_profiles"].items()}
     if cfg["mode"] not in ("name", "fulltext"):
@@ -758,7 +761,8 @@ def login(client_secret=None, fulltext=False, port=0, open_browser=True, timeout
                   "'Desktop app' client instead.\n")
         if open_browser:
             try:
-                Gio.AppInfo.launch_default_for_uri(url, None)
+                # Knowing the account up front lets the login open in its browser profile.
+                open_url(url, login_hint)
             except GLib.Error:
                 pass
         print("Waiting for you to approve access... (if Google shows an error page instead, "
@@ -779,6 +783,8 @@ def login(client_secret=None, fulltext=False, port=0, open_browser=True, timeout
             shutil.copyfile(client_secret, store)
             os.chmod(store, 0o600)
     print(f"Connected {email} (token saved to {path}).")
+    if login_hint and login_hint.lower() != email.lower():
+        print(f"Note: you asked for {login_hint} but logged in as {email}.")
     return email
 
 
@@ -1500,11 +1506,9 @@ API_IDS = {"drive": "drive.googleapis.com", "gmail": "gmail.googleapis.com",
            "calendar": "calendar-json.googleapis.com", "contacts": "people.googleapis.com"}
 
 WHY_A_CLIENT = """\
-  Google only lets a program ask for access on behalf of an "OAuth client" that is
-  registered in a Google Cloud project. This copy of the project does not ship one,
-  so you register yours: free, about five minutes, only once. No file of yours is
-  involved yet: the client only identifies the app; access is granted later, per
-  account, in your browser."""
+  You need a Google Cloud OAuth client: one-time setup, about 5 minutes, free.
+  Google requires one to identify any app that asks for access; it grants nothing
+  by itself. This project does not bundle one, so you create yours in three pages."""
 
 REFUSED_HINT = """\
   If Google refused the account, the usual reasons are:
@@ -1527,7 +1531,8 @@ def ask(prompt, default=""):
 
 
 def ask_yes_no(prompt, default=True):
-    answer = ask(f"{prompt} ({'Y/n' if default else 'y/N'})").lower()
+    # Say what Enter does instead of relying on the Y/n capitalization convention.
+    answer = ask(f"{prompt} [y/n, Enter = {'yes' if default else 'no'}]").lower()
     if not answer:
         return default
     return answer in ("y", "yes", "s", "si", "sí")
@@ -1678,6 +1683,40 @@ def choose_services(cfg):
         cfg["mode"] = "name"
 
 
+def merged_sort_order(current, ours):
+    """GNOME's search sort-order with our sections added, in our order.
+
+    GNOME Shell shows the providers listed in sort-order first and every other one
+    alphabetically, which would put Gmail before Google Drive. Ours are only appended:
+    whatever the user already arranged, including ours, is left as it is.
+    """
+    order = list(current)
+    missing = [desktop_id for desktop_id in ours if desktop_id not in order]
+    if len(missing) == len(ours):
+        return order + list(ours)
+    for desktop_id in missing:
+        # A section added by a later version goes right after the ones already placed.
+        last = max(order.index(i) for i in ours if i in order)
+        order.insert(last + 1, desktop_id)
+    return order
+
+
+def ensure_section_order():
+    """Register our sections in GNOME's sort-order; True if it changed, None if unavailable."""
+    schema = "org.gnome.desktop.search-providers"
+    source = Gio.SettingsSchemaSource.get_default()
+    if source is None or source.lookup(schema, True) is None:
+        return None
+    settings = Gio.Settings.new(schema)
+    current = list(settings.get_strv("sort-order"))
+    wanted = merged_sort_order(current, [f"{APP_ID}.{s.object_name}.desktop" for s in SERVICES])
+    if wanted == current:
+        return False
+    settings.set_strv("sort-order", wanted)
+    Gio.Settings.sync()
+    return True
+
+
 def provider_registration(service=None):
     """Path of the .ini GNOME Shell will load for a service, or None if it cannot see it."""
     service = service or SERVICES_BY_KEY["drive"]
@@ -1710,31 +1749,41 @@ def creation_steps(cfg):
     apis = ",".join(API_IDS[s.key] for s in enabled_services(cfg)) or API_IDS["drive"]
     names = ", ".join(s.api for s in enabled_services(cfg)) or DriveService.api
     return [
-        ("Project and APIs",
+        ("Create a project and enable the APIs",
          "https://console.cloud.google.com/flows/enableapi?apiid=" + apis,
-         [f"Pick 'Create project' (any name), continue, and press Enable. This turns on: {names}.",
-          "A first-time Google Cloud user is asked to accept its terms; no billing is needed."]),
-        ("Consent screen",
+         ["Choose 'Create project', not an existing one: a project carries its app name and "
+          "audience, and one made for something else may only accept its own organization.",
+          f"Then Next > Enable. Enables: {names}.",
+          "First-time Cloud users accept the terms there. No billing account needed."]),
+        ("Configure the OAuth consent screen",
          "https://console.cloud.google.com/auth/overview",
-         ["Press 'Get started'. App name: anything, it is what the login page will show.",
-          "Audience: External. (Internal only accepts accounts of one Workspace organization.)",
-          "Finish, then open 'Audience' in the left menu and press 'Publish app'.",
-          "Skipping 'Publish app' leaves it in Testing: logins expire every 7 days."]),
-        ("OAuth client",
+         ["Check that the project named at the top is the one you just created.",
+          "Get started > App name: any (shown at login) > Audience: External > Finish.",
+          "Then Audience > Publish app. Left in Testing, refresh tokens expire after 7 days "
+          "and only listed test users can log in."]),
+        ("Create the client",
          "https://console.cloud.google.com/auth/clients/create",
-         ["Application type: 'Desktop app'. Create, then 'Download JSON'.",
-          "Leave the file in your Downloads folder; the next step picks it up."]),
+         ["Application type: Desktop app > Create > Download JSON.",
+          "Leave the file in ~/Downloads; it is picked up next."]),
     ]
 
 
-def guide_client_creation(cfg):
-    """Walk through registering an OAuth client in the browser; returns its path or None."""
-    started = time.time()
+def guide_client_creation(cfg, config_path=None):
+    """Walk through registering an OAuth client in the browser; returns its path or None.
+
+    Any Google account can own the client, personal or from an organization. The owner
+    is remembered so the client can be told apart later.
+    """
+    # File timestamps come from a coarser clock than time.time() and can read a few
+    # milliseconds earlier than "now", so allow a little slack when asking what is new.
+    started = time.time() - 2
     print(WHY_A_CLIENT)
-    owner = ask("\n  Google account that will own the client (a personal one accepts any account "
-                "later; empty to skip opening pages)")
+    print("\n  Type the email of the Google account you will create the client with, for example\n"
+          "  you@gmail.com. The three pages below open in that account's browser profile.\n"
+          "  Or just press Enter to only get the links.")
+    owner = ask("  Email")
     for number, (title, url, lines) in enumerate(creation_steps(cfg), 1):
-        print(f"\n  Step {number} of 3: {title}")
+        print(f"\n  {number}/3  {title}")
         target = account_url(url, owner or None)
         print(f"    {target}")
         for line in lines:
@@ -1744,10 +1793,15 @@ def guide_client_creation(cfg):
                 open_url(target, owner, cfg)
             except GLib.Error as e:
                 print(f"    (could not open the browser: {e.message}; open the link yourself)")
-        ask("    Press Enter when that is done")
+        ask("    Press Enter when you have done that")
     while True:
         fresh = find_client_secret_candidates(since=started)
-        path = ask("\n  Path to the JSON you just downloaded (empty to stop)", fresh[0] if fresh else "")
+        if fresh:
+            path = ask("\n  Press Enter to use the file you just downloaded, or type the path of "
+                       "another one", fresh[0])
+        else:
+            print("\n  No client_secret*.json was downloaded to ~/Downloads since this step started.")
+            path = ask("  Type the path of the JSON file you downloaded, or just press Enter to stop here")
         if not path:
             return None
         path = os.path.expanduser(path)
@@ -1760,10 +1814,63 @@ def guide_client_creation(cfg):
             print("  That is a 'Web application' client; this needs a 'Desktop app' one. Create it "
                   "again with the right type.")
             continue
+        if owner:
+            cfg.setdefault("client_owners", {})[client["project"].lower()] = owner
+            save_client_owner(client["project"], owner, config_path)
         return path
 
 
-def setup_client(store=None, cfg=None):
+def save_client_owner(project, owner, path=None):
+    path = path or CONFIG_PATH
+    parser = configparser.ConfigParser()
+    parser.read(path)
+    if not parser.has_section("client_owners"):
+        parser.add_section("client_owners")
+    parser["client_owners"][project] = owner
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "w") as f:
+        parser.write(f)
+
+
+def client_label(client, cfg):
+    owner = (cfg.get("client_owners") or {}).get(client["project"].lower())
+    return client["project"] + (f" (created with {owner})" if owner else "")
+
+
+def pick_client(cfg, account=None, exclude=(), config_path=None):
+    """Which OAuth client to log an account in with; returns its path, or None to give up.
+
+    Any client may serve any account, so nothing is assumed: with several clients the
+    user picks, and the default is one created with an account of the same domain.
+    """
+    clients = [(c, p) for c, p in known_clients() if c["client_id"] not in exclude]
+    if not clients:
+        if not ask_yes_no("  Create an OAuth client for this account now?", True):
+            return None
+        path = guide_client_creation(cfg, config_path)
+        return remember_client(path) if path else None
+    if len(clients) == 1 and not exclude:
+        return clients[0][1]
+    domain = account.rsplit("@", 1)[-1].lower() if account and "@" in account else None
+    owners = cfg.get("client_owners") or {}
+    default = next((i for i, (c, _p) in enumerate(clients, 1)
+                    if domain and owners.get(c["project"].lower(), "").lower().endswith("@" + domain)), 1)
+    print("  OAuth client to log in with:")
+    for index, (client, _path) in enumerate(clients, 1):
+        print(f"    {index}) {client_label(client, cfg)}")
+    print("    n) create a new one")
+    answer = ask("  Type the number of the client to use, or n for a new one", str(default)).lower()
+    if answer == "n":
+        path = guide_client_creation(cfg, config_path)
+        return remember_client(path) if path else None
+    try:
+        return clients[int(answer) - 1][1]
+    except (ValueError, IndexError):
+        print("  Not one of the options.")
+        return None
+
+
+def setup_client(store=None, cfg=None, config_path=None):
     """Make sure there is an OAuth client to log in with; False if the user gives up."""
     store = store or CLIENT_SECRET_PATH
     cfg = cfg or DEFAULTS
@@ -1773,12 +1880,15 @@ def setup_client(store=None, cfg=None):
         try:
             client = load_client_secret(current)
             origin = "yours" if current == store else "shipped with this install"
-            print(f"  OAuth client: ready ({origin}, Google Cloud project {client['project']})")
-            print(f"  That project must have these APIs enabled: {apis}.")
+            extra = len(known_clients(store)) - 1
+            print(f"  OAuth client: ready ({origin}, Google Cloud project {client_label(client, cfg)})"
+                  + (f", plus {extra} more." if extra else "."))
+            print(f"  APIs its project needs enabled: {apis}.")
+            print("  Register another one, with any Google account, with --new-client.")
             return True
         except LoginError as e:
             print(f"  The stored OAuth client is unusable: {e}")
-    path = guide_client_creation(cfg)
+    path = guide_client_creation(cfg, config_path)
     if not path:
         return False
     os.makedirs(os.path.dirname(store), mode=0o700, exist_ok=True)
@@ -1855,6 +1965,9 @@ def _setup_steps(cfg, config_path):
     registered = {s.key: provider_registration(s) for s in SERVICES}
     if all(registered.values()):
         print("  OK: GNOME Shell can see the search sections, nothing to do here.")
+        if ensure_section_order():
+            print("  Their order in the overview is now " + ", ".join(s.label for s in SERVICES)
+                  + ", after your other results. Rearrange them in Settings > Search.")
         print(f"  (their definitions are installed in {os.path.dirname(registered['drive'])})")
     else:
         missing = ", ".join(s.label for s in SERVICES if not registered[s.key])
@@ -1870,44 +1983,49 @@ def _setup_steps(cfg, config_path):
     save_preferences(cfg, config_path)
 
     print("\n3. OAuth client")
-    have_client = setup_client(cfg=cfg)
+    have_client = setup_client(cfg=cfg, config_path=config_path)
 
     print("\n4. Google accounts")
     manager = AccountManager(cfg, quiet=True)
     scopes = login_scopes(cfg)
 
     def connect(hint=None):
-        # An account is authorized again with the client it was connected with.
-        client, path, tried = (client_of_account(hint) if hint else None), None, set()
+        """Log an account in. hint is set when authorizing a connected account again."""
+        if hint:
+            # Same client it was connected with: its refresh token belongs to that client.
+            client, path, address_hint = client_of_account(hint), None, hint
+        else:
+            # The account a client was created with is the obvious first one to connect.
+            connected = {a.identity.lower() for a in manager.all()}
+            suggested = next((owner for owner in (cfg.get("client_owners") or {}).values()
+                              if owner.lower() not in connected), "")
+            if suggested:
+                print(f"  Press Enter to connect {suggested}, or type the email of another Google "
+                      "account.\n  The login opens in that account's browser profile.")
+            else:
+                print("  Type the email of the Google account to connect, for example you@gmail.com.\n"
+                      "  The login opens in that account's browser profile. Or just press Enter to "
+                      "choose\n  the account in the browser instead.")
+            address_hint = ask("  Email", suggested) or None
+            client, path = None, pick_client(cfg, address_hint, config_path=config_path)
+            if not path:
+                return
+        tried = set()
         while True:
-            using = client or load_client_secret(path or default_client_path())
+            using = client or load_client_secret(path)
             tried.add(using["client_id"])
             try:
-                address = login(client_secret=path, client=client, scopes=scopes, login_hint=hint)
+                address = login(client_secret=path, client=client, scopes=scopes,
+                                login_hint=address_hint)
                 break
             except KeyboardInterrupt:
                 print("\n  Login cancelled.")
             except LoginError as e:
                 print(f"  Login failed: {e}")
             print(REFUSED_HINT.format(project=using["project"]))
-            others = [p for c, p in known_clients() if c["client_id"] not in tried]
-            if others:
-                path = os.path.expanduser(ask("  Path to another OAuth client for this account "
-                                              "(empty to skip it)", others[0]))
-            elif ask_yes_no("  Register another OAuth client now, for this account?", True):
-                path = guide_client_creation(cfg)
-                if path:
-                    path = remember_client(path)
-            else:
-                path = ""
+            client, path = None, pick_client(cfg, address_hint, exclude=tried, config_path=config_path)
             if not path:
                 return
-            try:
-                load_client_secret(path)
-            except LoginError as e:
-                print(f"  {e}")
-                return
-            client = None
         manager.invalidate()
         added = next((a for a in manager.all() if a.identity == address), None)
         if added:
@@ -1924,13 +2042,12 @@ def _setup_steps(cfg, config_path):
             print(f"    Cannot search {', '.join(s.label for s in lacking)}: its token does not "
                   "cover them.")
     if not manager.all():
-        print("  None yet.")
+        print("  No account connected yet. The OAuth client only identifies the app: each account\n"
+              "  still logs in and approves, once.")
     add = have_client and ask_yes_no(
         "  Add an account?" if not manager.all() else "  Add another account?",
         default=not manager.all())
     while add:
-        print("  Tip: with one browser profile per account, copy the link below into the "
-              "right profile.")
         connect()
         add = ask_yes_no("  Add another account?", default=False)
 
@@ -1940,7 +2057,7 @@ def _setup_steps(cfg, config_path):
     if not any(p.accounts() for p in providers):
         print("  No usable account, nothing to test. Run --setup again when you have one.")
         return 1
-    term = ask("  Type a word to try a search (empty to skip)")
+    term = ask("  Type a word to search for, to check it works, or just press Enter to skip")
     if term:
         print_results(providers, term.split(), limit=3, indent="    ")
     print("\nDone. Open the Activities overview and type to search."
@@ -1993,6 +2110,8 @@ def parse_args(argv):
                       help="with --login: fixed loopback port (only for 'Web application' clients)")
     auth.add_argument("--no-browser", action="store_true",
                       help="with --login: only print the link, do not open a browser")
+    auth.add_argument("--new-client", action="store_true",
+                      help="register one more OAuth client, with any Google account")
     auth.add_argument("--accounts", action="store_true",
                       help="list the accounts and what each one can search")
     auth.add_argument("--logout", metavar="EMAIL", help="remove an account and revoke its token")
@@ -2029,6 +2148,30 @@ def run_accounts(cfg):
     return 0
 
 
+def run_new_client(cfg, config_path=None):
+    """Register one more OAuth client; the first one becomes the default."""
+    if not sys.stdin.isatty():
+        print("Error: --new-client is interactive; run it in a terminal.", file=sys.stderr)
+        return 1
+    try:
+        path = guide_client_creation(cfg, config_path)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 130
+    if not path:
+        return 1
+    if os.path.exists(CLIENT_SECRET_PATH):
+        stored = remember_client(path)
+    else:
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+        shutil.copyfile(path, CLIENT_SECRET_PATH)
+        os.chmod(CLIENT_SECRET_PATH, 0o600)
+        stored = CLIENT_SECRET_PATH
+    print(f"  OAuth client saved to {stored}")
+    print("  Pick it when adding an account: gnome-google-workspace-search --setup")
+    return 0
+
+
 def migrate_legacy_config():
     """The project used to be gnome-drive-search-provider; bring its config along."""
     if os.path.isdir(LEGACY_CONFIG_DIR) and not os.path.exists(CONFIG_DIR):
@@ -2044,6 +2187,8 @@ def main(argv=None):
     cfg = load_config(args.config)
     if args.setup:
         return run_setup(cfg, args.config)
+    if args.new_client:
+        return run_new_client(cfg, args.config)
     try:
         if args.login:
             if args.fulltext:

@@ -125,6 +125,13 @@ about who else can read your home directory before enabling Gmail.
 A service can also be hidden at any time in **Settings > Search** without
 touching its permission.
 
+**Order of the sections.** GNOME Shell shows the providers listed in its
+`sort-order` setting first and every other one alphabetically, which would put
+Gmail above Google Drive. The setup therefore appends the four sections to that
+setting in the project's order (Drive, Contacts, Gmail, Calendar), after whatever
+you already had. It never rearranges existing entries, so an order you choose
+later in **Settings > Search** sticks.
+
 ### Several accounts
 
 Every account is searched at the same time, each result says which account it
@@ -206,22 +213,27 @@ apps and that every user shares your project's API quota.
 
 ### More than one OAuth client
 
-One client is usually enough, but not always. A client created as **Internal**
-inside a Google Workspace organization only accepts accounts of that
-organization: logging in with any other account ends on a Google error page
+Any Google account can own a client, personal or from an organization, and any
+client can serve any account. One is usually enough. The exception is a client
+whose audience is **Internal**: it only accepts accounts of its own Google
+Workspace organization, and any other account ends on a Google error page
 saying *"this client is restricted to users within its organization"*
-(`org_internal`). That is the typical situation with a work client and a
-personal Gmail account.
+(`org_internal`). Some organizations also block clients they do not own.
 
-When that happens, press Ctrl+C in the setup. It explains the likely cause and
-offers to register another client for that account with the same guided walk,
-this time **External** and owned by a personal account.
+So the setup assumes nothing. When you add an account it asks for its email
+first, which also lets the login open in that account's browser profile. With
+several clients it asks which one to use, suggesting one created with an account
+of the same domain, and lets you create a new one on the spot. If Google refuses
+the account, press Ctrl+C and it offers the remaining clients or a new one.
+
+```sh
+gnome-google-workspace-search --new-client   # register one more, with any account
+```
 
 Each account remembers the client it was connected with, refreshes its token
 with it, and is authorized again with it when you enable more services. Extra
 clients are kept in `~/.config/gnome-google-workspace-search/clients/`, and the
-default client is never replaced. From the command line:
-`--login --client-secret other.json`.
+default client is never replaced.
 
 ### Why not GNOME Online Accounts?
 
